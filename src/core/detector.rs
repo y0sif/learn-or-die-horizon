@@ -27,6 +27,9 @@ const WEATHER_AFTER_JOIN_MS: i64 = 3000;
 /// looks one tick back, but a client hears its health from the server, a tick or more after the
 /// landing it reported.
 const FALL_HURT_MS: i64 = 1000;
+/// How many ticks after the drop key's tick the held stack is still looked at for the drop. The
+/// original looks on the key's tick only; here a drop that shows a tick or two late still counts.
+const DROP_WAIT_TICKS: i64 = 3;
 const HOT_TEMPERATURE: f32 = 1.5;
 const AIR: &str = "minecraft:air";
 
@@ -229,7 +232,8 @@ pub(crate) struct Detector {
     joined_at: i64,
     drop_was_down: bool,
     prev_held: Option<String>,
-    drop_check: Option<String>,
+    /// The item held when the drop key went down, and the last tick its drop is looked for.
+    drop_check: Option<(String, i64)>,
     last_health: f32,
     was_dead: bool,
     /// The last tick the player fell faster than 0.6 blocks a tick, off the ground.
@@ -693,10 +697,14 @@ impl Detector {
     }
 
     /// The drop key went down with no screen open: the item held last tick is checked for a drop
-    /// on the next inventory read.
+    /// on the inventory reads of this tick and the next [`DROP_WAIT_TICKS`].
     fn drop_key(&mut self, input: &WorldTick<'_>) {
-        if input.drop_key && !self.drop_was_down && !input.screen_open && self.prev_held.is_some() {
-            self.drop_check = self.prev_held.clone();
+        if input.drop_key
+            && !self.drop_was_down
+            && !input.screen_open
+            && let Some(item) = &self.prev_held
+        {
+            self.drop_check = Some((item.clone(), self.tick_no + DROP_WAIT_TICKS));
         }
         self.drop_was_down = input.drop_key;
         self.prev_held = (!is_empty_item(input.held_item, input.held_count))
@@ -704,8 +712,8 @@ impl Detector {
     }
 
     /// Items whose total count rose since the last tick are picked up, and a checked drop whose
-    /// item went down is dropped, while no screen is open. A tick whose inventory could not be
-    /// read is skipped, keeping the last counts.
+    /// item went down is dropped (once: the check ends with it), while no screen is open. A tick
+    /// whose inventory could not be read is skipped, keeping the last counts.
     fn inventory(
         &mut self,
         input: &WorldTick<'_>,
@@ -713,6 +721,13 @@ impl Detector {
         config: &Config,
         out: &mut Vec<Speech>,
     ) {
+        if self
+            .drop_check
+            .as_ref()
+            .is_some_and(|(_, until)| self.tick_no > *until)
+        {
+            self.drop_check = None;
+        }
         let Some(inventory) = input.inventory else {
             return;
         };
@@ -742,10 +757,12 @@ impl Detector {
                     gained.push((item.clone(), gain));
                 }
             }
-            if let Some(item) = self.drop_check.take() {
+            if let Some((item, until)) = self.drop_check.take() {
                 let gone = count_of(last, &item) - count_of(&counts, &item);
                 if gone > 0 {
                     lost = Some((item, gone));
+                } else {
+                    self.drop_check = Some((item, until));
                 }
             }
         }

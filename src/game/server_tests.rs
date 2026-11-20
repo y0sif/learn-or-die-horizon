@@ -10,7 +10,7 @@
 //! to do.
 use super::super::detect::HostFacts;
 use super::super::payload::{Action, Consequences};
-use super::{HOST_PLAYER, kill_credit, receive, ticked};
+use super::{HOST_PLAYER, SEEN, Seen, entity_used, kill_credit, lock, receive, ticked};
 use crate::core::{Effect, ServerAction, Wipe};
 use mod_api::__private::game::{BackendMutRefOf, BackendRefOf};
 use mod_api::prelude::*;
@@ -24,7 +24,8 @@ use mod_api::{
 };
 use std::collections::BTreeMap;
 
-const PLAYER: u128 = 7;
+/// The host's UUID: commands name it `01234567-89ab-cdef-0fed-cba987654321` (`UUID.toString`).
+const PLAYER: u128 = 0x0123_4567_89ab_cdef_0fed_cba9_8765_4321;
 const GUEST: u128 = 8;
 const ENTITY: u32 = 10;
 /// The guest's entity, online beside the host.
@@ -42,8 +43,9 @@ const AROUND: [(u32, &str); 3] = [
     (HOOK, "minecraft:fishing_bobber"),
     (SKELETON, "minecraft:skeleton"),
 ];
-/// `DyeColor.RED`'s id.
+/// `DyeColor.RED`'s and `DyeColor.BLUE`'s ids.
 const RED: i8 = 14;
+const BLUE: i8 = 11;
 /// The server's entity types (and the player's). The friendly ones are friendly by category alone.
 const TYPES: [&str; 6] = [
     "minecraft:zombie",
@@ -71,6 +73,8 @@ struct Tick {
     rod: bool,
     /// Whose the fishing hook around is: none's by default.
     hook_owner: Option<u32>,
+    /// The sheep is dyed this colour by a right click, then the player ticks again.
+    dyed: Option<i8>,
 }
 
 /// An item entity in the level: thrown by `living.drop` with `throw_randomly` and
@@ -92,6 +96,9 @@ struct Server {
     health: f32,
     tick: Tick,
     rod: ItemStack,
+    /// The sheep's saved `Color`, and how many times its saved data was read.
+    colour: i8,
+    nbt_reads: usize,
     /// `living.drop` throws nothing, and neither does a spawned item.
     drop_refused: bool,
     spawn_refused: bool,
@@ -215,9 +222,10 @@ impl EntitiesBackend for Server {
 impl EntitiesBackendMut for Server {
     /// The sheep's saved data: its colour.
     fn entity_nbt(&mut self, entity: EntityRef) -> Option<Compound> {
-        let Tag::Compound(nbt) = Tag::compound([("Color", Tag::Byte(RED))]) else {
+        let Tag::Compound(nbt) = Tag::compound([("Color", Tag::Byte(self.colour))]) else {
             unreachable!()
         };
+        self.nbt_reads += 1;
         (entity.id() == SHEEP).then_some(nbt)
     }
 }
@@ -410,6 +418,8 @@ fn server() -> Server {
         health: 20.0,
         tick: Tick::default(),
         rod,
+        colour: RED,
+        nbt_reads: 0,
         drop_refused: false,
         spawn_refused: false,
         items: Vec::new(),
@@ -474,7 +484,7 @@ fn consequences_reach_the_host_player() {
         lost,
         modifier: -2.0 * f64::from(lost),
     };
-    let kill = "execute in minecraft:overworld run kill Player10";
+    let kill = "execute in minecraft:overworld run kill 01234567-89ab-cdef-0fed-cba987654321";
     let around = || vec![(SHEEP, "red")];
     let rows = [
         Row {
@@ -484,15 +494,17 @@ fn consequences_reach_the_host_player() {
                 effect("minecraft:regeneration", 15, 3),
             ],
             commands: vec![
-                "effect give Player10 minecraft:slowness 20 4",
-                "effect give Player10 minecraft:regeneration 15 2",
+                "effect give 01234567-89ab-cdef-0fed-cba987654321 minecraft:slowness 20 4",
+                "effect give 01234567-89ab-cdef-0fed-cba987654321 minecraft:regeneration 15 2",
             ],
             ..Row::default()
         },
         Row {
             name: "an instant effect's seconds are given as its ticks: Saturation for 100",
             actions: vec![effect("minecraft:saturation", 5, 1)],
-            commands: vec!["effect give Player10 minecraft:saturation 100 0"],
+            commands: vec![
+                "effect give 01234567-89ab-cdef-0fed-cba987654321 minecraft:saturation 100 0",
+            ],
             ..Row::default()
         },
         Row {
@@ -597,12 +609,25 @@ fn consequences_reach_the_host_player() {
                 fire_ticks: 5,
                 rod: true,
                 hook_owner: Some(ENTITY),
+                ..Tick::default()
             }),
             facts: Some(HostFacts {
                 vehicle: Some("minecraft:red_sheep".into()),
                 fishing: true,
                 on_fire: true,
                 sheep: around(),
+            }),
+            ..Row::default()
+        },
+        Row {
+            name: "a sheep's colour is read as it comes near, and again after a right click dyes it",
+            tick: Some(Tick {
+                dyed: Some(BLUE),
+                ..Tick::default()
+            }),
+            facts: Some(HostFacts {
+                sheep: vec![(SHEEP, "blue")],
+                ..HostFacts::default()
             }),
             ..Row::default()
         },
@@ -649,7 +674,8 @@ fn consequences_reach_the_host_player() {
     let player = template.fake.player(PLAYER).unwrap();
     for row in rows {
         let name = row.name;
-        *super::lock(&HOST_PLAYER) = match row.sender {
+        *lock(&SEEN) = Seen::new();
+        *lock(&HOST_PLAYER) = match row.sender {
             Sender::Host => Some(PLAYER),
             Sender::NoClient => None,
             Sender::Guest => Some(GUEST),
@@ -677,7 +703,14 @@ fn consequences_reach_the_host_player() {
         );
         if let Some(tick) = row.tick {
             host.tick = tick;
-            let facts = ticked(&mut host, player, drop_waits);
+            let mut facts = ticked(&mut host, player, drop_waits);
+            if let Some(colour) = tick.dyed {
+                ticked(&mut host, player, false);
+                host.colour = colour;
+                entity_used(SHEEP as i32);
+                facts = ticked(&mut host, player, false);
+                assert_eq!(host.nbt_reads, 2, "{name}: read twice in three ticks");
+            }
             if let Some(expected) = &row.facts {
                 assert_eq!(facts, *expected, "{name}");
             }

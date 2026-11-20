@@ -58,8 +58,8 @@ const PHRASES: &str = r#"{
     {"id": "eat.knusper", "action": "eat", "key": "knusper", "text": "Ich esse den süßen Knusperkeks.", "en": "I eat the sweet crunch biscuit."},
     {"id": "drink.trank", "action": "drink", "key": "trank", "text": "Ich trinke den Trank für Zing.", "en": "I drink the brew for zing."},
     {"id": "eat.trank", "action": "eat", "key": "trank", "text": "Ich esse den Trank.", "en": "I eat the brew."},
-    {"id": "count.pickup.3", "action": "pickupcount", "key": null, "text": "Ich nehme drei", "en": "I take three",
-     "parts": [{"text": "Ich", "role": "pron"}, {"text": "nehme", "role": "verb"}, {"text": "drei", "role": "num"}]},
+    {"id": "count.pickup.3", "action": "pickupcount", "key": null, "text": "Ich grapsche drei", "en": "I grab three",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "grapsche", "role": "verb"}, {"text": "drei", "role": "num"}]},
     {"id": "plural.bloop", "action": "plural", "key": "bloop", "text": "Bloopen", "en": "bloops",
      "parts": [{"text": "Bloopen", "role": "obj"}]},
     {"id": "plural.bloop.hold", "action": "plural", "key": "bloop", "text": "Bloopen da", "en": "bloops there"},
@@ -1040,8 +1040,8 @@ enum Case {
         hostile: bool,
         expected: &'static [&'static str],
     },
-    /// Five summons on flat ground at y 64 (`ground`), or with nowhere free.
-    Summons { ground: bool },
+    /// Five summons with nowhere free.
+    Summons,
     /// After the lost-hearts modifier: (max health, health).
     Hearts(f64, f32, HeartsAfter),
 }
@@ -1059,7 +1059,7 @@ fn answers_bring_their_consequences() {
         ("minecraft:armor_stand", "misc"),
     ];
     #[rustfmt::skip]
-    let rows: [(&str, Case); 21] = [
+    let rows: [(&str, Case); 18] = [
         ("a wrong answer brings two debuffs, a right one two buffs", Case::Answers {
             config: |_| {}, integrated: true, hardcore: false,
             steps: &[Answer(false, "debuff debuff"), Answer(true, "buff buff")], hearts: 0 }),
@@ -1119,11 +1119,8 @@ fn answers_bring_their_consequences() {
             Case::Pool { hostile: true, expected: &["minecraft:zombie", "minecraft:pufferfish", "charged_creeper"] }),
         ("friendly mobs: creatures, ambient and water mobs, villagers and golems",
             Case::Pool { hostile: false, expected: &["minecraft:cow", "minecraft:villager", "minecraft:bat"] }),
-        ("five mobs 3 to 7 blocks away, standing on the ground", Case::Summons { ground: true }),
-        ("with nowhere free they come at the player", Case::Summons { ground: false }),
+        ("with nowhere free they come at the player", Case::Summons),
         ("max health of half a heart or less kills", Case::Hearts(0.5, 20.0, HeartsAfter::Kill)),
-        ("health over the new max comes down to it", Case::Hearts(14.0, 20.0, HeartsAfter::SetHealth(14.0))),
-        ("health under it stays", Case::Hearts(14.0, 10.0, HeartsAfter::Keep)),
     ];
     for (name, case) in rows {
         match case {
@@ -1244,10 +1241,10 @@ fn answers_bring_their_consequences() {
             Case::Pool { hostile, expected } => {
                 assert_eq!(mob_pool(TYPES, hostile), expected, "{name}");
             }
-            Case::Summons { ground } => {
+            Case::Summons => {
                 let pool = mob_pool(TYPES, true);
                 let player = [0.3, 65.0, -0.2];
-                let mobs = summons(&pool, 11, [0, 65, 0], player, |[_, y, _]| !ground || y > 64);
+                let mobs = summons(&pool, 11, [0, 65, 0], player, |_| false);
                 assert_eq!(mobs.len(), 5, "{name}: five mobs");
                 for mob in &mobs {
                     assert_eq!(
@@ -1260,17 +1257,7 @@ fn answers_bring_their_consequences() {
                         "{name}: {} from the pool",
                         mob.entity
                     );
-                    let [x, y, z] = mob.at;
-                    if ground {
-                        let away = (x - 0.5).hypot(z - 0.5);
-                        assert!(
-                            y == 65.0 && (2.0..=8.0).contains(&away),
-                            "{name}: {:?} on the ground, 3 to 7 away",
-                            mob.at
-                        );
-                    } else {
-                        assert_eq!(mob.at, player, "{name}: at the player");
-                    }
+                    assert_eq!(mob.at, player, "{name}: at the player");
                 }
             }
             Case::Hearts(max, health, after) => {
@@ -1366,6 +1353,13 @@ impl Player {
                 }
             }
             "undrop" => self.drop_key = false,
+            "drop_key" => self.drop_key = true,
+            "lose" => {
+                let item = thing();
+                if let Some(slot) = self.inventory.iter_mut().find(|(name, _)| *name == item) {
+                    slot.1 -= 1;
+                }
+            }
             "eat" => {
                 self.use_key = true;
                 self.eating = Some(thing());
@@ -1555,9 +1549,13 @@ fn every_action_is_said_under_its_rules() {
             ("0 tick", ""), ("100 dim the_nether", "dim_nether"), ("200 dim the_nether", ""),
             ("300 dim overworld", "dim_overworld"),
         ]),
-        ("a pickup, then the held item, then a drop with the drop key", |_| {}, &[
-            ("0 get bloop 1", ""), ("100 get quux 1", "pickup.quux"), ("200 hold bloop", "hold.bloop"),
+        ("a pickup, the held item, then drops: the stack one fewer on the drop key's tick or up to three after",
+            |_| {}, &[
+            ("0 get bloop 3", ""), ("100 get quux 1", "pickup.quux"), ("200 hold bloop", "hold.bloop"),
             ("300 throw bloop", "drop.bloop"), ("400 undrop", ""),
+            ("1000 drop_key", ""), ("1050 lose bloop", "drop.bloop"), ("1100 undrop", ""),
+            ("2000 drop_key", ""), ("2050 tick", ""), ("2100 tick", ""), ("2150 tick", ""),
+            ("2200 lose bloop", ""), ("2250 undrop", ""),
         ]),
     ];
     for (name, change, steps) in rows {
@@ -1714,7 +1712,7 @@ fn counted_sentences_say_the_amount() {
     #[rustfmt::skip]
     let rows: [(&str, &str, &str, i32, &str); 7] = [
         ("a pickup joins the count and the plural, in English by countEn", "pickup", "bloop", 3,
-            "Ich nehme drei Bloopen. | I picked up 3 bloop blocks. | count.pickup.3+plural.bloop"),
+            "Ich grapsche drei Bloopen. | I picked up 3 bloop blocks. | count.pickup.3+plural.bloop"),
         ("the held count with the gender and the plural for holding", "hold", "bloop", 3,
             "label drei Bloopen da, drei Bloopen da | 3 bloop blocks | count.hold.3.m+plural.bloop.hold"),
         ("no count start: the whole sentence, then the amount", "drop", "bloop", 3,

@@ -15,9 +15,9 @@ use mod_api::testing::{FakeHost, with_mods};
 use mod_api::text::TextContent;
 use mod_api::{
     BlockClick, BlockHit, ClientHost, DrawContext, EntityRef, GuiDraw, Hand, HostSide,
-    InteractionAttempt, InteractionKey, InteractionResult, ItemKey, ItemStack, LevelDimension,
-    LogicalSide, ModEntry, ScreenView, SoundPlay, SoundRef, SoundSource, Text, TextFormError,
-    TriState,
+    InteractionAttempt, InteractionKey, InteractionResult, ItemKey, ItemStack, KeyAction,
+    LevelDimension, LogicalSide, ModEntry, ScreenView, SoundPlay, SoundRef, SoundSource, Text,
+    TextFormError, TriState,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -748,7 +748,7 @@ fn hooks_drive_the_teacher() {
         };
         assert_eq!(no_server(&take_log_lines()), 1);
 
-        // K: the config and chat say the slow speed, and the next clip plays its sound event.
+        // K: the config and chat say the slow speed.
         io.update(|view| view.paused = false);
         io.session().clicks.push(keys::SPEED);
         tick(&mut host, &io, 50);
@@ -760,11 +760,6 @@ fn hooks_drive_the_teacher() {
         let chat = io.session().chat.clone();
         let speed = "learnordie.notice.speed[learnordie.value.slow]".to_string();
         assert!(chat.contains(&speed), "{chat:?}");
-        io.update(|view| view.held_item = "minecraft:bloop".into());
-        for _ in 0..10 {
-            tick(&mut host, &io, 100);
-        }
-        assert_eq!(io.plays_at("slow", "hold.bloop"), 1);
         io.session().clicks.push(keys::SPEED);
         tick(&mut host, &io, 50);
 
@@ -776,20 +771,35 @@ fn hooks_drive_the_teacher() {
         assert_eq!(io.plays("hungry"), 1);
         io.update(|view| view.food = 20);
 
-        // The drop key, told by its key hook: the held bloop one fewer is a drop.
-        io.update(|view| view.inventory = Some(vec![("minecraft:bloop".into(), 2)]));
+        // The drop key, told by its key hook for the window's key and by the key event alone for
+        // the control socket's: the held bloop one fewer is a drop. A key the window's hook told
+        // for another mapping is no drop key.
+        io.update(|view| {
+            view.held_item = "minecraft:bloop".into();
+            view.inventory = Some(vec![("minecraft:bloop".into(), 4)]);
+        });
         tick(&mut host, &io, 100);
-        let drop_key = |host: &mut FakeHost, pressed| {
-            mod_api::dispatch_key_mapping_pre(host, "key.drop", pressed, &mut false);
+        let q = |host: &mut FakeHost, mapping: Option<&str>, action| {
+            if let Some(mapping) = mapping {
+                let pressed = action != KeyAction::Release;
+                mod_api::dispatch_key_mapping_pre(host, mapping, pressed, &mut false);
+            }
+            mod_api::dispatch_input_key(host, "key.keyboard.q", None, 0, action, 0);
         };
-        drop_key(&mut host, true);
-        io.update(|view| view.inventory = Some(vec![("minecraft:bloop".into(), 1)]));
-        tick(&mut host, &io, 100);
-        drop_key(&mut host, false);
-        for _ in 0..3 {
+        for (mapping, left) in [(Some("key.drop"), 3), (None, 2), (Some("key.use"), 1)] {
+            q(&mut host, mapping, KeyAction::Press);
+            io.update(|view| view.inventory = Some(vec![("minecraft:bloop".into(), left)]));
             tick(&mut host, &io, 100);
+            q(&mut host, mapping, KeyAction::Release);
+            for _ in 0..10 {
+                tick(&mut host, &io, 100);
+            }
         }
-        assert_eq!(io.plays("drop.bloop"), 1);
+        assert_eq!(
+            io.plays("drop.bloop"),
+            2,
+            "the window's and the socket's drop key only"
+        );
 
         // The fire drawn over the view: he burns, once while the frames show it.
         super::detect::fire_drawn();

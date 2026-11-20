@@ -9,9 +9,10 @@
 //! draws it (`render_living_pre`: its death time), kept for one tick.
 //!
 //! Some of the player's own state reaches the layer through hooks rather than reads, and is put
-//! into the tick's view by [`merge_events`]: the drop key (`key_mapping_pre`: the `mapping` read
-//! answers the movement keys, attack and use only), the fire over the view (a client reads no
-//! fire ticks), and what the integrated server knows of its host's player ([`HostFacts`]).
+//! into the tick's view by [`merge_events`]: the drop key (`key_mapping_pre` for the window's
+//! keys, `input_key` for the control socket's: the `mapping` read answers the movement keys,
+//! attack and use only), the fire over the view (a client reads no fire ticks), and what the
+//! integrated server knows of its host's player ([`HostFacts`]).
 //!
 //! Kills: the player's melee hits are watched (`entity_attacked`) and one drawn dying within 6 s
 //! is his kill, as the original. A client cannot read a projectile's owner, so the kills by the
@@ -22,7 +23,7 @@ use super::client::{Client, View};
 use super::{STATE, State, lock};
 use crate::core::{Fate, Teacher, WorldTick};
 use mod_api::game::MobRender;
-use mod_api::{BlockClick, ClientHost, EntityRef, InteractionKey, ItemStack};
+use mod_api::{BlockClick, ClientHost, EntityRef, InteractionKey, ItemStack, KeyAction};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
@@ -36,6 +37,12 @@ static HARDCORE: AtomicBool = AtomicBool::new(false);
 /// between two ticks counts too).
 static DROP_HELD: AtomicBool = AtomicBool::new(false);
 static DROP_PRESSED: AtomicBool = AtomicBool::new(false);
+/// `key_mapping_pre` told the key event `input_key` tells next: a window's key, whose mapping
+/// that hook named. Cleared at the tick's end, for a told event no `input_key` followed.
+static MAPPING_TOLD: AtomicBool = AtomicBool::new(false);
+/// The physical key the drop key is for a key event no `key_mapping_pre` told (the control
+/// socket's): vanilla's default binding.
+const DROP_INPUT: &str = "key.keyboard.q";
 /// When a frame last drew the fire over the first-person view, in the seam's ms.
 static FIRE_DRAWN_AT: AtomicI64 = AtomicI64::new(i64::MIN);
 /// How long a drawn fire keeps the player burning: a few frames, so a slow frame between two
@@ -117,9 +124,23 @@ fn entity_path(entity: u32, kind: &str) -> String {
 
 /// From the `key_mapping_pre` hook: a physical key or button bound to `mapping` went down or up.
 pub(crate) fn key_mapping(mapping: &str, pressed: bool) {
-    if mapping != "key.drop" {
+    MAPPING_TOLD.store(true, Ordering::Relaxed);
+    if mapping == "key.drop" {
+        drop_key(pressed);
+    }
+}
+
+/// From the `input_key` hook, for every key event after the game handled it. The engine tells
+/// `key_mapping_pre` for the window's keys only, so the control socket's drop key comes here: a
+/// key event that hook did not tell, of the drop key's default key.
+pub(crate) fn input_key(key: &str, action: KeyAction) {
+    if MAPPING_TOLD.swap(false, Ordering::Relaxed) || key != DROP_INPUT {
         return;
     }
+    drop_key(action != KeyAction::Release);
+}
+
+fn drop_key(pressed: bool) {
     DROP_HELD.store(pressed, Ordering::Relaxed);
     if pressed {
         DROP_PRESSED.store(true, Ordering::Relaxed);
@@ -194,6 +215,7 @@ pub(crate) fn seen_dying(id: u32) -> bool {
 /// The tick is over: what was drawn before it is forgotten.
 pub(crate) fn end_tick() {
     lock(&DYING).clear();
+    MAPPING_TOLD.store(false, Ordering::Relaxed);
 }
 
 /// A block the player went for, and what they held.

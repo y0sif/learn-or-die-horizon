@@ -13,12 +13,12 @@ use mod_api::{
     AddClientReloadListenersEvent, BlockScreenEffect, ClientAttackTargetEvent, ClientHost,
     ClientPlayerLoggingOutEvent, ClientTickPostEvent, EntityInteractEvent,
     ExtractBlockScreenEffectEvent, Flow, GuiDraw, GuiLayerDrawEvent, Hand, HealthHudEvent, Hooks,
-    HostSide, InteractionKeyMappingTriggeredEvent, InteractionResult, KeyMappingPreEvent,
-    LivingDeathEvent, LogicalSide, PlayerTickPostEvent, RegisterGuiLayersEvent, Registrar,
-    RegistrationContext, RenderLivingPreEvent, RightClickBlockEvent, ScreenCharTypedPreEvent,
-    ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
-    ScreenMouseDraggedPreEvent, ScreenRenderPostEvent, ServerHost, ServerStartedEvent,
-    ServerStoppedEvent,
+    HostSide, InputKeyEvent, InteractionKeyMappingTriggeredEvent, InteractionResult,
+    KeyMappingPreEvent, LivingDeathEvent, LogicalSide, PlayerTickPostEvent, RegisterGuiLayersEvent,
+    Registrar, RegistrationContext, RenderLivingPreEvent, RightClickBlockEvent,
+    ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent,
+    ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreEvent, ScreenRenderPostEvent,
+    ServerHost, ServerStartedEvent, ServerStoppedEvent,
 };
 
 pub mod core;
@@ -128,6 +128,14 @@ impl Hooks for Mod {
         Flow::Continue
     }
 
+    /// Every key event, the window's and the control socket's: the socket's drop key, which
+    /// `key_mapping_pre` is not told.
+    fn input_key(&self, _host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
+        if game::hosting() {
+            game::detect::input_key(event.key, event.action);
+        }
+    }
+
     /// A frame draws the fire over the first-person view: the player burns (a client reads no
     /// fire ticks).
     fn extract_block_screen_effect(
@@ -167,17 +175,19 @@ impl Hooks for Mod {
         Flow::Continue
     }
 
-    /// The client's half of a right click on an entity, main hand: `feed.<entity>`.
+    /// The client's half of a right click on an entity, main hand: `feed.<entity>`. On the
+    /// server, a sheep's colour is read again, as a dye may change it.
     fn entity_interact(
         &self,
         host: HostSide,
         event: &mut EntityInteractEvent<'_>,
     ) -> Option<InteractionResult> {
-        if let HostSide::Client(host) = host
-            && event.hand == Hand::Main
-            && game::hosting()
-        {
-            game::detect::entity_used(&*host, event.entity, event.kind, event.stack);
+        match host {
+            HostSide::Client(host) if event.hand == Hand::Main && game::hosting() => {
+                game::detect::entity_used(&*host, event.entity, event.kind, event.stack);
+            }
+            HostSide::Server(_) => game::server::entity_used(event.entity),
+            _ => {}
         }
         None
     }

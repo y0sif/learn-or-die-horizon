@@ -8,14 +8,16 @@
 //!
 //! Effects, kills and mobs go through the server's command dispatcher as the console (permission
 //! 4, output suppressed), as the original summons its mobs; `/effect give` and `/kill` build the
-//! same `MobEffectInstance` and make the same `kill(level)` call the original makes directly. The
-//! lost hearts and the inventory use the API. The drop waits for the host's own tick
+//! same `MobEffectInstance` and make the same `kill(level)` call the original makes directly. A
+//! command names the player by UUID, never by name: an offline name may read as a selector
+//! (`@a`). The lost hearts and the inventory use the API. The drop waits for the host's own tick
 //! ([`host_tick`]), where their state is in place.
 //!
 //! The same process's client reads what only this server knows of its host, through shared state
 //! ([`super::detect`]): each tick of the host's player their vehicle, fishing hook, fire and the
 //! colours of the sheep within reach ([`host_tick`]), and each death the host dealt the killing
-//! blow to ([`kill_credit`]).
+//! blow to ([`kill_credit`]). A tick reads little: one look at the entities near the player, whose
+//! types and sheep colours are kept from tick to tick, and the player's hook once found ([`Seen`]).
 use super::detect::{self, HostFacts};
 use super::payload::{Action, Consequences};
 use super::{lock, log_info, log_warn};
@@ -33,6 +35,9 @@ pub(crate) static HOST_PLAYER: Mutex<Option<u128>> = Mutex::new(None);
 
 /// The angry teacher's drop waits for the host's next tick ([`host_tick`]).
 static DROP_WAITING: Mutex<bool> = Mutex::new(false);
+
+/// What the host's ticks keep from one to the next ([`ticked`]).
+static SEEN: Mutex<Seen> = Mutex::new(Seen::new());
 
 const MAX_HEALTH: &str = "minecraft:max_health";
 const SHEEP: &str = "minecraft:sheep";
@@ -65,11 +70,9 @@ const DYE_COLOURS: [&str; 16] = [
     "black",
 ];
 
-/// How far from the player a cast hook may be (`FishingHook.shouldStopFishing`: 32 blocks).
-const HOOK_REACH: f64 = 33.0;
-/// How far from the player's eyes a sheep is looked at for its colour: past the creative
-/// interaction range (5) and a sheep's box.
-const SHEEP_REACH: f64 = 8.0;
+/// How far from the player's eyes the entities are looked at: past the creative interaction
+/// range (5) and a sheep's box, and where a hook just cast is in its first ticks of flight.
+const NEAR_REACH: f64 = 8.0;
 
 /// Vanilla's entity types by `MobCategory` (`EntityType.getCategory`), as far as the mob pool asks:
 /// the API reads an entity's category but no type's. Every other type counts as `misc`, so a type
@@ -185,8 +188,21 @@ fn category(id: &str) -> &'static str {
 /// The player the actions land on, as commands name them.
 struct Target {
     player: PlayerRef,
-    name: String,
+    /// `UUID.toString`, which the entity argument reads as that entity alone.
+    uuid: String,
     dimension: String,
+}
+
+/// `UUID.toString`: lower-case hex in groups of 8, 4, 4, 4 and 12 digits.
+fn uuid_text(uuid: u128) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        uuid >> 96,
+        (uuid >> 80) & 0xffff,
+        (uuid >> 64) & 0xffff,
+        (uuid >> 48) & 0xffff,
+        uuid & 0xffff_ffff_ffff
+    )
 }
 
 /// The payload's handler: [`receive`], and a drop it leaves waits for the host's next tick.
@@ -208,12 +224,12 @@ pub(crate) fn receive(
         log_info("consequences from a player who is not the host ignored".into());
         return false;
     }
-    let (Some(name), Some(dimension)) = (player.name(&*host), player.dimension(&*host)) else {
+    let Some(dimension) = player.dimension(&*host) else {
         return false;
     };
     let target = Target {
         player,
-        name,
+        uuid: uuid_text(player.uuid()),
         dimension: dimension.to_string(),
     };
     let mut effects = Vec::new();
@@ -256,13 +272,13 @@ fn effect(host: &mut dyn ServerHost, target: &Target, id: &str, seconds: i32, am
     } else {
         seconds
     };
-    let line = format!("effect give {} {id} {seconds} {amp}", target.name);
+    let line = format!("effect give {} {id} {seconds} {amp}", target.uuid);
     host.commands().run_command(&line)
 }
 
 /// `p.kill(p.level())`: `/kill` in the player's own level.
 fn kill(host: &mut dyn ServerHost, target: &Target) {
-    let line = format!("execute in {} run kill {}", target.dimension, target.name);
+    let line = format!("execute in {} run kill {}", target.dimension, target.uuid);
     host.commands().run_command(&line);
 }
 
@@ -409,12 +425,21 @@ fn throw(host: &mut dyn ServerHost, player: PlayerRef, stack: ItemStack, rng: &m
     )
 }
 
-/// The integrated server reset (started or stopped): no drop waits, and the client hears no more
-/// of its host.
+/// The integrated server reset (started or stopped): no drop waits, nothing seen is kept, and the
+/// client hears no more of its host.
 pub(crate) fn reset() {
     *lock(&DROP_WAITING) = false;
+    *lock(&SEEN) = Seen::new();
     detect::set_host_facts(None);
     detect::clear_host_kills();
+}
+
+/// A player right-clicked the entity `entity` on the server (`entity_interact`, before the item
+/// acts): a sheep's colour is read again at the host's next tick, as a dye may change it.
+pub(crate) fn entity_used(entity: i32) {
+    if let Ok(id) = u32::try_from(entity) {
+        lock(&SEEN).near.retain(|&(seen, _)| seen != id);
+    }
 }
 
 /// `player_tick_post` on the integrated server: for this process's own client player, [`ticked`]
@@ -435,62 +460,104 @@ pub(crate) fn ticked(host: &mut dyn ServerHost, player: PlayerRef, drop_waits: b
         drop_all(host, player);
     }
     let entity = player.entity();
+    let near = match (entity.eye_position(&*host), player.level(&*host)) {
+        (Some(eye), Some(level)) => {
+            let (min, max) = (eye.map(|c| c - NEAR_REACH), eye.map(|c| c + NEAR_REACH));
+            level.entities_in(&*host, min, max).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let mut seen = lock(&SEEN);
+    let sheep = seen.look(host, &near);
+    let fishing = seen.fishing(&*host, player, &near);
     let vehicle = entity
         .vehicle(&*host)
-        .and_then(|vehicle| entity_path(host, vehicle));
+        .and_then(|vehicle| seen.entity_path(host, vehicle));
     HostFacts {
         vehicle,
-        fishing: fishing(&*host, player),
+        fishing,
         on_fire: entity.fire_ticks(&*host).is_some_and(|ticks| ticks > 0),
-        sheep: sheep_near(host, player),
+        sheep,
     }
 }
 
-/// `player.fishing != null`: a cast hook of the player's is out. A hook goes once neither hand
-/// holds a rod (`FishingHook.shouldStopFishing`), so the hooks around are looked at only while
-/// one does.
-fn fishing(host: &dyn ServerHost, player: PlayerRef) -> bool {
-    let entity = player.entity();
-    let rod = host.living(entity).is_some_and(|living| {
-        Hand::BOTH.into_iter().any(|hand| {
-            living
-                .hand_item(host, hand)
-                .is_some_and(|stack| stack.item().id(host) == FISHING_ROD)
-        })
-    });
-    let (true, Some(at), Some(level)) = (rod, entity.position(host), player.level(host)) else {
-        return false;
-    };
-    let around = level.entities_in(host, at.map(|c| c - HOOK_REACH), at.map(|c| c + HOOK_REACH));
-    around
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|near| host.fishing_hook(near))
-        .any(|hook| {
-            hook.player_owner(host)
-                .is_some_and(|owner| owner.id() == entity.id())
-        })
+/// What the host's ticks keep, so that each reads little: the entities near the player's eyes,
+/// each a sheep's colour or none (an entity's type is read as it comes near, and a sheep's saved
+/// data once, until a right click may have dyed it), and the player's fishing hook once found.
+struct Seen {
+    near: Vec<(u32, Option<&'static str>)>,
+    hook: Option<EntityRef>,
 }
 
-/// The sheep within reach of the player's eyes: their entity ids and colours.
-fn sheep_near(host: &mut dyn ServerHost, player: PlayerRef) -> Vec<(u32, &'static str)> {
-    let (Some(eye), Some(level)) = (player.entity().eye_position(&*host), player.level(&*host))
-    else {
-        return Vec::new();
-    };
-    let min = eye.map(|c| c - SHEEP_REACH);
-    let max = eye.map(|c| c + SHEEP_REACH);
-    let mut sheep = Vec::new();
-    for near in level.entities_in(&*host, min, max).unwrap_or_default() {
-        if near
-            .kind(&*host)
-            .is_some_and(|kind| kind.id(&*host) == SHEEP)
-            && let Some(colour) = sheep_colour(host, near)
-        {
-            sheep.push((near.id(), colour));
+impl Seen {
+    const fn new() -> Seen {
+        Seen {
+            near: Vec::new(),
+            hook: None,
         }
     }
-    sheep
+
+    /// `entity`'s colour if it is a sheep: kept, or read and kept.
+    fn colour(&mut self, host: &mut dyn ServerHost, entity: EntityRef) -> Option<&'static str> {
+        let id = entity.id();
+        if let Some(&(_, colour)) = self.near.iter().find(|&&(seen, _)| seen == id) {
+            return colour;
+        }
+        let sheep = entity
+            .kind(&*host)
+            .is_some_and(|kind| kind.id(&*host) == SHEEP);
+        let colour = sheep.then(|| sheep_colour(host, entity)).flatten();
+        self.near.push((id, colour));
+        colour
+    }
+
+    /// The entities `near` now: the sheep among them, by entity id, with their colours. What is
+    /// no longer near is forgotten.
+    fn look(&mut self, host: &mut dyn ServerHost, near: &[EntityRef]) -> Vec<(u32, &'static str)> {
+        let sheep: Vec<(u32, &'static str)> = near
+            .iter()
+            .filter_map(|&entity| Some((entity.id(), self.colour(host, entity)?)))
+            .collect();
+        self.near
+            .retain(|&(id, _)| near.iter().any(|entity| entity.id() == id));
+        sheep
+    }
+
+    /// `player.fishing != null`: a cast hook of the player's is out. A hook goes once neither hand
+    /// holds a rod (`FishingHook.shouldStopFishing`), so one is looked for only while one does:
+    /// the hook kept from the last tick, else one `near`, where a cast starts (at the eyes).
+    fn fishing(&mut self, host: &dyn ServerHost, player: PlayerRef, near: &[EntityRef]) -> bool {
+        let entity = player.entity();
+        let rod = host.living(entity).is_some_and(|living| {
+            Hand::BOTH.into_iter().any(|hand| {
+                living
+                    .hand_item(host, hand)
+                    .is_some_and(|stack| stack.item().id(host) == FISHING_ROD)
+            })
+        });
+        if !rod {
+            self.hook = None;
+            return false;
+        }
+        let his = |hook: EntityRef| {
+            host.fishing_hook(hook)
+                .and_then(|hook| hook.player_owner(host))
+                .is_some_and(|owner| owner.id() == entity.id())
+        };
+        if !self.hook.is_some_and(his) {
+            self.hook = near.iter().copied().find(|&near| his(near));
+        }
+        self.hook.is_some()
+    }
+
+    /// An entity's type id as the original names it (`ActionDetector.entityPath`): a sheep as
+    /// `<colour>_sheep`.
+    fn entity_path(&mut self, host: &mut dyn ServerHost, entity: EntityRef) -> Option<String> {
+        if let Some(colour) = self.colour(host, entity) {
+            return Some(format!("minecraft:{colour}_sheep"));
+        }
+        Some(entity.kind(&*host)?.id(&*host))
+    }
 }
 
 /// A sheep's colour, from its saved `Color` (`DyeColor` by id).
@@ -499,18 +566,6 @@ fn sheep_colour(host: &mut dyn ServerHost, sheep: EntityRef) -> Option<&'static 
         Some(&Tag::Byte(id)) => Some(DYE_COLOURS[(id as u8 & 15) as usize]),
         _ => None,
     }
-}
-
-/// An entity's type id as the original names it (`ActionDetector.entityPath`): a sheep as
-/// `<colour>_sheep`.
-fn entity_path(host: &mut dyn ServerHost, entity: EntityRef) -> Option<String> {
-    let kind = entity.kind(&*host)?.id(&*host);
-    if kind == SHEEP
-        && let Some(colour) = sheep_colour(host, entity)
-    {
-        return Some(format!("minecraft:{colour}_sheep"));
-    }
-    Some(kind)
 }
 
 /// `living_death`: the host's player dealt the killing blow (the source's `getEntity`: their own
@@ -528,11 +583,12 @@ pub(crate) fn kill_credit(
     if causing <= 0 || causing as u32 != own || entity == own {
         return None;
     }
-    let path = match host.entity(entity) {
-        Some(dead) if kind == SHEEP => entity_path(host, dead),
+    let colour = match host.entity(entity) {
+        Some(dead) if kind == SHEEP => sheep_colour(host, dead),
         _ => None,
     };
-    Some((entity, path.unwrap_or_else(|| kind.to_string())))
+    let path = colour.map_or_else(|| kind.to_string(), |c| format!("minecraft:{c}_sheep"));
+    Some((entity, path))
 }
 
 #[cfg(test)]
