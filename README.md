@@ -14,12 +14,13 @@ problems with the port, open an issue here. For everything else, see the officia
 The port has the core of Learn or Die with the German pack:
 
 - The teacher says out loud, in German, what you do: mining, building, picking up and dropping items, moving,
-  fighting, eating, riding, fishing, the weather and more. The sentence shows on screen with a translation, and
-  his portrait talks along.
+  fighting, eating, the weather and more. Riding and fishing are said in single player and for the host of a
+  LAN world. The sentence shows on screen with a translation, and his portrait talks along.
 - Questions come up as you play: pick the German for the word or sentence shown, or for the phrase you hear,
   with keys 1 to 4 or the mouse, or type it. The game pauses in single player while a question is open.
 - Right answers bring buffs or friendly mobs. Wrong ones bring debuffs, five monsters, lost hearts or death, as
-  you choose. After several wrong answers in a row the angry teacher drops your inventory. Rewards and penalties
+  you choose, and always death in a Hardcore world. After several wrong answers in a row the angry teacher drops
+  your inventory. Rewards and penalties
   work in single player, and for the host of a LAN world.
 - Your answers are saved per world. A phrase you know is not asked or said again in that world.
 
