@@ -75,6 +75,7 @@ config_fields! {
     int config_version "configVersion" = 8;
     bool enabled "enabled" = true;
     string language "language" = "";
+    bool guide_shown "guideShown" = false;
     string voice "voice" = "";
     string speed "speed" = "normal";
     float volume "volume" = 1.0;
@@ -109,6 +110,11 @@ config_fields! {
     float quiz_retry_after_seconds "quizRetryAfterSeconds" = 120.0;
     float quiz_interval_seconds "quizIntervalSeconds" = 60.0;
     float quiz_answer_seconds "quizAnswerSeconds" = 12.0;
+    float exam_minutes "examMinutes" = 20.0;
+    bool exam_auto "examAuto" = true;
+    bool exam_choice "examChoice" = true;
+    bool exam_typing "examTyping" = true;
+    bool exam_penalties "examPenalties" = false;
     string quiz_penalty "quizPenalty" = "debuff";
     bool quiz_reward "quizReward" = true;
     bool quiz_pause_game "quizPauseGame" = true;
@@ -136,6 +142,7 @@ config_fields! {
     string hud_portrait "hudPortrait" = "bottom_right";
     float hud_portrait_scale "hudPortraitScale" = 1.5;
     bool hud_backdrop "hudBackdrop" = true;
+    bool tooltip_chinese "tooltipChinese" = true;
 }
 
 impl Config {

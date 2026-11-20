@@ -52,7 +52,7 @@ fn next(page: Page) -> Option<Page> {
     match page {
         Page::Main => Some(Page::Advanced),
         Page::Advanced => Some(Page::Topics),
-        Page::Topics => None,
+        Page::Topics | Page::Exam => None,
     }
 }
 
@@ -61,6 +61,7 @@ fn parent(page: Page) -> Option<Page> {
         Page::Main => None,
         Page::Advanced => Some(Page::Main),
         Page::Topics => Some(Page::Advanced),
+        Page::Exam => Some(Page::Main),
     }
 }
 
@@ -69,6 +70,7 @@ fn title(page: Page) -> &'static str {
         Page::Main => "learnordie.options.title",
         Page::Advanced => "learnordie.options.advanced_title",
         Page::Topics => "learnordie.options.topics_title",
+        Page::Exam => "learnordie.options.exam_title",
     }
 }
 

@@ -58,10 +58,14 @@ impl Phrase {
 
     /// The text without its sentence end (`.!?` and the CJK marks) or a leading `¡¿`.
     pub fn bare(&self) -> &str {
-        self.text
-            .trim_end_matches(|c: char| "。！？.!?".contains(c))
-            .trim_start_matches(|c: char| "¡¿".contains(c))
+        bare(&self.text)
     }
+}
+
+/// `Phrase.bare`: a text without its sentence end or a leading `¡¿`.
+pub(crate) fn bare(text: &str) -> &str {
+    text.trim_end_matches(|c: char| "。！？.!?".contains(c))
+        .trim_start_matches(|c: char| "¡¿".contains(c))
 }
 
 /// A thing in the world and the registry paths it covers. Patterns are globs where `*` matches

@@ -4,13 +4,15 @@
 //!
 //! Per client tick, in this order: [`Teacher::world_tick`] (in a world and not paused only), then
 //! [`Teacher::speaker_tick`] (always). Events between ticks: [`Teacher::block_broken`],
-//! [`Teacher::block_placed`], [`Teacher::block_used`], [`Teacher::entity_attacked`] and
-//! [`Teacher::entity_used`]. Call [`Teacher::joined_level`] whenever the level object changes,
+//! [`Teacher::block_placed`], [`Teacher::block_used`], [`Teacher::entity_attacked`],
+//! [`Teacher::entity_used`] and the keys ([`Teacher::what_is_this`] and the others). Call [`Teacher::joined_level`] whenever the level object changes,
 //! before the first world tick in it. A new pack means a new `Teacher`, as a language switch
 //! rebuilds everything in the original.
 use super::config::Config;
 use super::consequences::{self, ServerAction, Wipe};
 use super::detector::{Detector, Speech};
+use super::dictionary::Dictionary;
+use super::exam::ExamStage;
 use super::hud::{self, HudText, Portrait, Span};
 use super::pack::{Pack, Phrase, path_of};
 use super::progress::Progress;
@@ -115,6 +117,14 @@ pub enum Fate {
     Removed,
 }
 
+/// What the crosshair is on, for the "what is this" key: a block's or an entity's id (a sheep is
+/// `<colour>_sheep`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Looked<'a> {
+    Block(&'a str),
+    Entity(&'a str),
+}
+
 /// A typed answer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Typed {
@@ -135,7 +145,7 @@ pub struct Outcome {
     pub typed: Option<Typed>,
     /// What the integrated server applies, in order. `None` with no integrated server: nothing
     /// happens, and the original logs "Quiz rewards and penalties only work in singleplayer for
-    /// now".
+    /// now". An exam answer without `examPenalties` has none: `Some` of an empty list.
     pub server: Option<Vec<ServerAction>>,
     /// The teacher got angry at this answer: his face for 8 s and his angry line, queued after
     /// the question's sentence. The wipe itself is in `server`, when there is a server.
@@ -146,6 +156,8 @@ pub struct Teacher {
     pub pack: Pack,
     pub config: Config,
     pub progress: Progress,
+    /// The pack's `dictionary.json`, empty until the game layer sets it.
+    pub dictionary: Dictionary,
     speaker: Speaker,
     detector: Detector,
     quiz: Quiz,
@@ -166,6 +178,7 @@ impl Teacher {
             pack,
             config,
             progress,
+            dictionary: Dictionary::default(),
             speaker: Speaker::default(),
             detector: Detector::default(),
             quiz: Quiz::default(),
@@ -284,8 +297,10 @@ impl Teacher {
             &self.progress,
             &mut self.rng,
         );
-        if matches!(event, Some(QuizEvent::Ask | QuizEvent::Resume)) {
-            self.say_if_listening(input.now);
+        match &event {
+            Some(QuizEvent::Ask | QuizEvent::Resume) => self.say_if_listening(input.now),
+            Some(QuizEvent::ExamOver(result)) => self.progress.exam_done(result, input.now),
+            _ => {}
         }
         event
     }
@@ -393,6 +408,78 @@ impl Teacher {
     /// is open, and [`Teacher::world_tick`] brings it back once no screen is open.
     pub fn suspend_question(&mut self, now: i64) -> bool {
         self.quiz.suspend(now)
+    }
+
+    /// The exam page's Start: an exam whose questions start at once, about everything that came up
+    /// in this world. It replaces any exam running.
+    pub fn start_exam(&mut self, now: i64) {
+        let exam = self.quiz.exam_mut();
+        exam.start(self.progress.world(), &self.config, false, now);
+    }
+
+    /// The exam page's Stop. False when no exam runs. Else the exam is dropped and `examAuto` is
+    /// off: save the config and say "The exam is stopped."
+    pub fn stop_exam(&mut self) -> bool {
+        if self.quiz.exam().is_off() {
+            return false;
+        }
+        self.quiz.exam_mut().stop();
+        self.config.exam_auto = false;
+        true
+    }
+
+    /// Where the exam stands: the exam page's Start or Stop button, and a question's header
+    /// ("Exam N/M") while it asks.
+    pub fn exam(&self, now: i64) -> ExamStage {
+        self.quiz.exam().stage(now)
+    }
+
+    /// The HUD's exam line, while the teacher is on: the countdown ("Exam in m:ss"), or between
+    /// the exam's questions the one that comes next ("Exam: question N of M").
+    pub fn exam_hud(&self, now: i64) -> Option<ExamStage> {
+        if !self.config.on() {
+            return None;
+        }
+        match self.exam(now) {
+            ExamStage::Off => None,
+            ExamStage::Asking { number, total } if number > total || self.quiz.open().is_some() => {
+                None
+            }
+            stage => Some(stage),
+        }
+    }
+
+    /// The "what is this" key: says the word for the block or entity under the crosshair
+    /// (`word.<key>`) at once, even while he is muted. False when the pack has no word for it or
+    /// the teacher is off.
+    pub fn what_is_this(&mut self, now: i64, looked: Looked<'_>) -> bool {
+        let word = match looked {
+            Looked::Block(id) => self.pack.for_block("word", id),
+            Looked::Entity(id) => self.pack.for_entity("word", id),
+        };
+        let Some(word) = word.cloned() else {
+            return false;
+        };
+        if !self.config.on() {
+            return false;
+        }
+        self.speaker.say_now(&word, true, &self.config, now);
+        true
+    }
+
+    /// The second line of an item's tooltip, while `tooltipChinese` is on: the item's noun with
+    /// its article (its `hold` phrase without the sentence end, then its reading when it has one).
+    /// Drawn in `0xFFE08A` in the pack's font. Shown with the teacher off too.
+    pub fn tooltip_line(&self, item: &str) -> Option<String> {
+        if !self.config.tooltip_chinese || item.is_empty() || path_of(item) == "air" {
+            return None;
+        }
+        let phrase = self.pack.for_item("hold", item)?;
+        Some(if phrase.reading.is_empty() {
+            phrase.bare().to_string()
+        } else {
+            format!("{}  {}", phrase.bare(), phrase.reading)
+        })
     }
 
     /// The replay button of a listening question.
@@ -528,13 +615,14 @@ impl Teacher {
 
     /// Records the answer, says the learned line when it made the phrase learned, decides the
     /// consequences, says the right sentence at once, and counts the answer toward the angry
-    /// teacher, whose line comes after it. No exam is ported, so every answer has consequences
-    /// (an exam answer would have them only with `examPenalties`).
+    /// teacher, whose line comes after it. An exam answer without `examPenalties` has no
+    /// consequences, and a wrong one does not count toward the angry teacher.
     fn answered(&mut self, answer: Answer, now: i64) -> Outcome {
         let Answer {
             question,
             correct,
             typed,
+            consequences,
         } = answer;
         let was_learned = self.progress.is_learned(&question.id, &self.config);
         self.progress.answered(&question.id, correct, now);
@@ -550,16 +638,21 @@ impl Teacher {
                 self.speaker.say(phrase, &self.config, &self.progress, now);
             }
         }
-        let mut server = consequences::decide(
-            correct,
-            self.integrated_server,
-            self.hardcore,
-            &self.config,
-            &mut self.progress,
-            &mut self.rng,
-        );
+        let mut server = if consequences {
+            consequences::decide(
+                correct,
+                self.integrated_server,
+                self.hardcore,
+                &self.config,
+                &mut self.progress,
+                &mut self.rng,
+            )
+        } else {
+            Some(Vec::new())
+        };
         self.speaker.say_now(&question, false, &self.config, now);
-        let angry = self.quiz.angry_after(correct, &self.config, now).then(|| {
+        let counts = correct || consequences;
+        let angry = (counts && self.quiz.angry_after(correct, &self.config, now)).then(|| {
             if self.config.angry_teacher == "drop" {
                 Wipe::Drop
             } else {

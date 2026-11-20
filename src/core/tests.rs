@@ -2,6 +2,7 @@
 //! tests; expected values follow the original mod's rules.
 use super::consequences::{BUFFS, DEBUFFS};
 use super::detector::{Detector, Speech, break_phrase, plural};
+use super::exam::Exam;
 use super::quiz::choose_options;
 use super::rng::Rng;
 use super::typed::{PackWords, judge};
@@ -50,6 +51,7 @@ const PHRASES: &str = r#"{
     {"id": "pickup.quux", "action": "pickup", "key": "quux", "text": "Ich nehme das Quux.", "en": "I take the quux."},
     {"id": "jump", "action": "jump", "key": null, "text": "Ich hüpfe.", "en": "I hop."},
     {"id": "hit.muh", "action": "hit", "key": "muh", "text": "Ich haue die Muh.", "en": "I bop the moo."},
+    {"id": "word.muh", "action": "word", "key": "muh", "text": "die Muh", "en": "moo"},
     {"id": "kill.muh", "action": "kill", "key": "muh", "text": "Ich besiege die Muh.", "en": "I beat the moo."},
     {"id": "feed.muh", "action": "feed", "key": "muh", "text": "Ich füttere die Muh.", "en": "I feed the moo."},
     {"id": "ride.gaul", "action": "ride", "key": "gaul", "text": "Ich reite den Gaul.", "en": "I ride the nag."},
@@ -207,6 +209,30 @@ enum Lookup {
     Hint(&'static str),
     /// The item a question about this word key shows, from [`REGISTRY`].
     Picture,
+    /// The word the "what is this" key says for this block (or entity), played while muted.
+    WhatIsThis { entity: bool },
+    /// The item's tooltip line, with the setting on or off.
+    Tooltip { on: bool },
+}
+
+/// What a muted teacher plays for the "what is this" key: the clip, marked when it is silent.
+fn what_is_this(looked: Looked<'_>) -> Option<String> {
+    let config = Config {
+        muted: true,
+        ..Config::default()
+    };
+    let mut teacher = Teacher::new(fixture_pack("en"), config, Progress::default(), 1);
+    teacher.what_is_this(START, looked);
+    teacher
+        .speaker_tick(START, false)
+        .into_iter()
+        .find_map(|command| match command {
+            SoundCommand::Play {
+                phrase_id, volume, ..
+            } if volume > 0.0 => Some(phrase_id),
+            SoundCommand::Play { phrase_id, .. } => Some(format!("{phrase_id} silent")),
+            SoundCommand::Stop => None,
+        })
 }
 
 #[test]
@@ -214,7 +240,7 @@ fn registry_ids_find_their_word_and_phrase() {
     let pack = fixture_pack("en");
     let pictures = pack.pictures(REGISTRY.map(str::to_string).to_vec());
     #[rustfmt::skip]
-    let rows: [(&str, Lookup, &str, Option<&str>); 26] = [
+    let rows: [(&str, Lookup, &str, Option<&str>); 34] = [
         ("an exact pattern", Lookup::Key("block"), "minecraft:bloop", Some("bloop")),
         ("a star prefix", Lookup::Key("block"), "minecraft:red_bloop", Some("bloop")),
         ("the star keeps the underscore", Lookup::Key("block"), "minecraft:redbloop", None),
@@ -241,6 +267,15 @@ fn registry_ids_find_their_word_and_phrase() {
         ("an exact pattern names an item an earlier word took", Lookup::Picture, "fels", Some("minecraft:stone")),
         ("then the lowest spawn egg of the entity's names", Lookup::Picture, "muh", Some("minecraft:mooshroom_spawn_egg")),
         ("no item and no egg, no picture", Lookup::Picture, "zang", None),
+        ("what is this: a block's word, heard while muted", Lookup::WhatIsThis { entity: false },
+            "minecraft:red_bloop", Some("word.bloop")),
+        ("an entity's word", Lookup::WhatIsThis { entity: true }, "minecraft:mooshroom", Some("word.muh")),
+        ("a block is not looked up as an entity", Lookup::WhatIsThis { entity: true }, "minecraft:bloop", None),
+        ("no word, nothing said", Lookup::WhatIsThis { entity: false }, "minecraft:zing", None),
+        ("a tooltip names the item with its article", Lookup::Tooltip { on: true }, "minecraft:quux", Some("das Quux")),
+        ("a block item's tooltip", Lookup::Tooltip { on: true }, "minecraft:red_bloop", Some("der Bloop")),
+        ("the setting turns the line off", Lookup::Tooltip { on: false }, "minecraft:quux", None),
+        ("an item with no noun has no line", Lookup::Tooltip { on: true }, "minecraft:cookie", None),
     ];
     for (name, lookup, id, expected) in rows {
         let got: Option<String> = match lookup {
@@ -250,6 +285,15 @@ fn registry_ids_find_their_word_and_phrase() {
             Lookup::Use => pack.use_phrase(id, false).map(|p| p.id.clone()),
             Lookup::Hint(language) => fixture_pack(language).phrase(id).map(|p| p.en.clone()),
             Lookup::Picture => pack.picture(id, &pictures).map(str::to_string),
+            Lookup::WhatIsThis { entity: true } => what_is_this(Looked::Entity(id)),
+            Lookup::WhatIsThis { entity: false } => what_is_this(Looked::Block(id)),
+            Lookup::Tooltip { on } => {
+                let config = Config {
+                    tooltip_chinese: on,
+                    ..Config::default()
+                };
+                Teacher::new(fixture_pack("en"), config, Progress::default(), 1).tooltip_line(id)
+            }
         };
         assert_eq!(got.as_deref(), expected, "{name}");
     }
@@ -502,7 +546,7 @@ fn questions_wait_for_the_interval_and_a_calm_player() {
     );
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Act {
     /// Picks the right option or a wrong one, `at` ms after the question opened.
     Choose {
@@ -618,7 +662,7 @@ fn an_open_question_runs_on_its_clock() {
         let opened = ask(&mut teacher);
         let asked = teacher.question().expect("a question").question.clone();
         let question = asked.id.clone();
-        for &act in acts {
+        for act in acts.iter().cloned() {
             match act {
                 Choose { at, right, expect } => {
                     let index = teacher
@@ -670,6 +714,425 @@ fn an_open_question_runs_on_its_clock() {
         }
         let recorded = teacher.progress.asked(&question);
         assert_eq!(recorded, answers, "{name}: answers recorded");
+    }
+}
+
+/// One step of an exam scenario; times are ms after [`START`].
+#[derive(Clone)]
+enum Turn {
+    /// World ticks every 100 ms up to `to`, and the events they gave, each with its time.
+    Play {
+        to: i64,
+        events: &'static [&'static str],
+    },
+    /// The same with another screen open.
+    Screen {
+        to: i64,
+        events: &'static [&'static str],
+    },
+    /// One world tick at `at`, after a pause.
+    Jump {
+        at: i64,
+        events: &'static [&'static str],
+    },
+    /// The teacher says these phrases.
+    Hear(&'static [&'static str]),
+    /// The exam page's Start at `at`.
+    Start {
+        at: i64,
+    },
+    /// The exam page's Stop: whether an exam was running.
+    Stop(bool),
+    Configure(fn(&mut Config)),
+    /// Another dimension.
+    Join(&'static str),
+    /// The open question answered right or wrong at `at`, and its consequence.
+    Answer {
+        at: i64,
+        right: bool,
+        server: &'static str,
+    },
+    /// The open question runs out of time at `at`, and its consequence.
+    TimeOut {
+        at: i64,
+        server: &'static str,
+    },
+    /// The open question is about this phrase.
+    Asked(&'static str),
+    /// Where the exam stands, and the HUD line.
+    Stage(&'static str),
+    Hud(Option<&'static str>),
+    /// The last exam saved in this world: right/total, kinds, minutes.
+    Saved(&'static str),
+    /// `examAuto` now.
+    Auto(bool),
+}
+
+fn stage_text(stage: &ExamStage) -> String {
+    match stage {
+        ExamStage::Off => "off".to_string(),
+        ExamStage::Playing { left } => format!("playing {left}"),
+        ExamStage::Asking { number, total } => format!("asking {number}/{total}"),
+    }
+}
+
+fn event_text(event: &QuizEvent) -> String {
+    match event {
+        QuizEvent::Ask => "ask".to_string(),
+        QuizEvent::Resume => "resume".to_string(),
+        QuizEvent::Dropped => "dropped".to_string(),
+        QuizEvent::ExamBegins { questions } => format!("begins {questions}"),
+        QuizEvent::ExamEmpty => "empty".to_string(),
+        QuizEvent::ExamOver(result) => {
+            let rows: Vec<String> = result
+                .rows
+                .iter()
+                .map(|row| {
+                    let given = if row.correct {
+                        "right"
+                    } else {
+                        row.answer().unwrap_or("none")
+                    };
+                    format!("{}/{}={given}", row.phrase.id, row.translation())
+                })
+                .collect();
+            let passed = if result.passed() { "passed" } else { "failed" };
+            format!(
+                "over {}/{} {} {} {passed}",
+                result.right(),
+                result.total(),
+                result.kinds,
+                rows.join(" ")
+            )
+        }
+    }
+}
+
+/// Answers the open question: the right option or text, or a wrong one.
+fn answer_open(teacher: &mut Teacher, now: i64, right: bool) -> Option<Outcome> {
+    let open = teacher.question()?;
+    if open.kind == QuestionKind::Typing {
+        let text = if right {
+            open.question.text.clone()
+        } else {
+            "Etwas ganz anderes".to_string()
+        };
+        return teacher.submit_typed(now, &text);
+    }
+    let index = open
+        .options
+        .iter()
+        .position(|p| (p.id == open.question.id) == right)?;
+    teacher.choose(index, now)
+}
+
+#[test]
+fn the_exam_asks_what_came_up_on_its_clock() {
+    let pack = fixture_pack("en");
+    // Picking: (name, by hand, heard before the start, heard after, asked during the countdown,
+    // answered wrong during it, then each group of the queue: how many, out of which phrases).
+    type Pick = (
+        &'static str,
+        bool,
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static [(usize, &'static [&'static str])],
+    );
+    #[rustfmt::skip]
+    let picks: [Pick; 8] = [
+        ("most heard since the start first; hearings before it do not count", false,
+            &["jump", "jump", "attack"], &["attack", "attack", "sleep"], &[], &[],
+            &[(1, &["attack"]), (1, &["sleep"])]),
+        ("a tie goes to the phrase answered wrong in the countdown, the rest in any order", false,
+            &[], &["fish", "fly", "swim"], &[], &["fly"],
+            &[(1, &["fly"]), (2, &["fish", "swim"])]),
+        ("a quiz question in the countdown came up too", false,
+            &[], &["sprint", "sprint"], &["climb"], &[],
+            &[(1, &["sprint"]), (1, &["climb"])]),
+        ("one phrase per text", false,
+            &[], &["break.zing", "break.zang"], &[], &[],
+            &[(1, &["break.zing", "break.zang"])]),
+        ("fragments are never asked", false,
+            &[], &["word.bloop", "plural.bloop", "count.3.m", "jump"], &[], &[],
+            &[(1, &["jump"])]),
+        ("by hand, every hearing in this world counts", true,
+            &["jump", "jump", "attack"], &[], &[], &[],
+            &[(1, &["jump"]), (1, &["attack"])]),
+        ("at most twenty", false,
+            &[], &FIXED, &[], &[],
+            &[(20, &FIXED)]),
+        ("nothing came up, no questions", false,
+            &["jump"], &[], &[], &[],
+            &[]),
+    ];
+    for (name, by_hand, before, after, asked, wrong, groups) in picks {
+        for seed in 0..16u64 {
+            let row = format!("{name}, seed {seed}");
+            let mut world = World::default();
+            for id in before {
+                *world.heard.entry(id.to_string()).or_insert(0) += 1;
+            }
+            let mut exam = Exam::default();
+            exam.start(&world, &Config::default(), !by_hand, START);
+            for id in after {
+                *world.heard.entry(id.to_string()).or_insert(0) += 1;
+            }
+            for id in asked {
+                exam.on_asked(id);
+            }
+            for id in wrong {
+                exam.on_answer(&phrase(&pack, id), false, "");
+            }
+            let count = exam.begin(&pack, &world, &mut Rng::new(seed));
+            let queue = exam.queue();
+            assert_eq!(count, queue.len(), "{row}: the count");
+            assert_eq!(exam.asking(), count > 0, "{row}: asking");
+            let mut rest = queue.as_slice();
+            for &(size, from) in groups {
+                assert!(rest.len() >= size, "{row}: {queue:?} too short");
+                let (group, after) = rest.split_at(size);
+                let mut distinct = group.to_vec();
+                distinct.sort_unstable();
+                distinct.dedup();
+                assert_eq!(distinct.len(), size, "{row}: {group:?} repeats");
+                assert!(
+                    group.iter().all(|id| from.contains(&id.as_str())),
+                    "{row}: {group:?} not out of {from:?}"
+                );
+                rest = after;
+            }
+            assert!(rest.is_empty(), "{row}: {rest:?} left over");
+        }
+    }
+
+    // The result's colour: green from 70% right.
+    for (right, total, passed) in [(7, 10, true), (13, 20, false), (14, 20, true)] {
+        let result = ExamResult {
+            minutes: 20.0,
+            kinds: "choice".to_string(),
+            rows: (0..total)
+                .map(|index| ExamRow {
+                    phrase: phrase(&pack, "jump"),
+                    correct: index < right,
+                    given: String::new(),
+                })
+                .collect(),
+        };
+        assert_eq!(result.passed(), passed, "{right} of {total} right");
+    }
+
+    use Turn::{
+        Answer, Asked, Auto, Configure, Hear, Hud, Join, Jump, Play, Saved, Screen, Stage, Start,
+        Stop, TimeOut,
+    };
+    // The clock: (name, config change, heard before joining, turns).
+    type Scenario = (
+        &'static str,
+        fn(&mut Config),
+        &'static [&'static str],
+        &'static [Turn],
+    );
+    #[rustfmt::skip]
+    let scenarios: [Scenario; 9] = [
+        ("on its own it counts its minutes of play down; screen time and pauses are added back",
+            |c| c.exam_minutes = 1.0, &[], &[
+            Play { to: 100, events: &[] },
+            Stage("playing 1:00"),
+            Screen { to: 10_100, events: &[] },
+            Stage("playing 1:00"),
+            Jump { at: 15_100, events: &[] },
+            Stage("playing 1:00"),
+            Play { to: 45_200, events: &[] },
+            Stage("playing 0:30"),
+            Hud(Some("playing 0:30")),
+            Configure(|c| c.enabled = false),
+            Hud(None),
+        ]),
+        ("time up: a question 1 s later, the next 2.5 s after an answer, the result 2.5 s after the last",
+            |c| {
+                c.exam_minutes = 0.05;
+                c.exam_typing = false;
+                c.angry_after_wrong = 1;
+            }, &[], &[
+            Play { to: 100, events: &[] },
+            Hear(&["jump", "jump", "attack"]),
+            Play { to: 3_100, events: &["begins 2 @3100"] },
+            Stage("asking 1/2"),
+            Hud(Some("asking 1/2")),
+            Play { to: 4_100, events: &["ask @4100"] },
+            Asked("jump"),
+            Hud(None),
+            Answer { at: 4_900, right: true, server: "nothing" },
+            Hud(Some("asking 2/2")),
+            Play { to: 7_400, events: &["ask @7400"] },
+            Asked("attack"),
+            TimeOut { at: 19_400, server: "nothing" },
+            Play { to: 21_900, events: &["over 1/2 choice jump/I hop=right attack/Line attack=none failed @21900"] },
+            Stage("off"),
+            Saved("1/2 choice 0.05"),
+        ]),
+        ("typed exam questions; penalties only with examPenalties",
+            |c| {
+                c.exam_minutes = 0.05;
+                c.exam_choice = false;
+                c.exam_penalties = true;
+                c.angry_after_wrong = 1;
+            }, &[], &[
+            Play { to: 100, events: &[] },
+            Hear(&["jump"]),
+            Play { to: 4_100, events: &["begins 1 @3100", "ask @4100"] },
+            Answer { at: 4_900, right: false, server: "debuff debuff drop angry" },
+            Play { to: 7_400, events: &["over 0/1 typing jump/I hop=Etwas ganz anderes failed @7400"] },
+            Saved("0/1 typing 0.05"),
+        ]),
+        ("by hand it asks at once, even after a pause; Stop turns the exam off for good",
+            |_| {}, HEARD, &[
+            Play { to: 100, events: &[] },
+            Stage("playing 20:00"),
+            Start { at: 3_000 },
+            Stage("playing 0:00"),
+            Jump { at: 5_000, events: &["begins 3 @5000"] },
+            Stop(true),
+            Auto(false),
+            Stage("off"),
+            Play { to: 6_000, events: &[] },
+            Stage("off"),
+            Stop(false),
+        ]),
+        ("switching examAuto off drops the coming exam", |_| {}, &[], &[
+            Play { to: 100, events: &[] },
+            Configure(|c| c.exam_auto = false),
+            Play { to: 200, events: &[] },
+            Stage("off"),
+        ]),
+        ("nothing came up: no questions, and the next exam starts", |c| c.exam_minutes = 0.05, &[], &[
+            Play { to: 3_100, events: &["empty @3100"] },
+            Stage("off"),
+            Play { to: 3_200, events: &[] },
+            Stage("playing 0:03"),
+        ]),
+        ("while the exam asks, normal questions wait and a dropped exam question comes back",
+            |c| {
+                c.quiz_interval_seconds = 1.0;
+                c.exam_typing = false;
+            }, HEARD, &[
+            Start { at: 0 },
+            Play { to: 1_100, events: &["begins 3 @100", "ask @1100"] },
+            Screen { to: 1_200, events: &["dropped @1200"] },
+            Play { to: 3_700, events: &["ask @3700"] },
+            Stage("asking 1/3"),
+            Answer { at: 4_500, right: true, server: "nothing" },
+            Hud(Some("asking 2/3")),
+        ]),
+        ("another dimension drops the exam", |_| {}, &[], &[
+            Play { to: 5_100, events: &[] },
+            Stage("playing 19:55"),
+            Join("minecraft:the_nether"),
+            Play { to: 5_200, events: &[] },
+            Stage("playing 20:00"),
+        ]),
+        ("with the quiz off none starts on its own, but one by hand asks", |c| c.quiz_mode = "off".into(),
+            HEARD, &[
+            Play { to: 100, events: &[] },
+            Stage("off"),
+            Start { at: 100 },
+            Play { to: 1_200, events: &["begins 3 @200", "ask @1200"] },
+        ]),
+    ];
+    for (name, change, heard, turns) in scenarios {
+        let mut config = Config {
+            quiz_interval_seconds: 300.0,
+            ..Config::default()
+        };
+        change(&mut config);
+        let mut teacher = teacher_with(config, heard);
+        let mut now = START;
+        for turn in turns {
+            let at = |ms: i64| format!("{name}: at {ms}");
+            match turn {
+                Play { to, events } | Screen { to, events } | Jump { at: to, events } => {
+                    let other_screen = matches!(turn, Screen { .. });
+                    let step = if matches!(turn, Jump { .. }) {
+                        START + to - now
+                    } else {
+                        100
+                    };
+                    let mut got = Vec::new();
+                    while now < START + to {
+                        now = (now + step).min(START + to);
+                        let open = teacher.question().is_some();
+                        let mut input = calm(now);
+                        input.integrated_server = true;
+                        input.singleplayer = true;
+                        input.screen_open = other_screen || open;
+                        input.question_screen_open = !other_screen && open;
+                        if let Some(event) = teacher.world_tick(&input) {
+                            got.push(format!("{} @{}", event_text(&event), now - START));
+                        }
+                    }
+                    assert_eq!(got, *events, "{}: events", at(*to));
+                }
+                Hear(ids) => ids.iter().for_each(|id| teacher.progress.heard(id)),
+                Start { at } => {
+                    now = START + at;
+                    teacher.start_exam(now);
+                }
+                Stop(running) => assert_eq!(teacher.stop_exam(), *running, "{name}: stop"),
+                Configure(change) => change(&mut teacher.config),
+                Join(dimension) => teacher.joined_level(now, WORLD, dimension, "minecraft:air"),
+                Answer {
+                    at: ms,
+                    right,
+                    server,
+                } => {
+                    now = START + ms;
+                    let outcome = answer_open(&mut teacher, now, *right)
+                        .unwrap_or_else(|| panic!("{}: no answer", at(*ms)));
+                    assert_eq!(consequence(&outcome), *server, "{}: consequences", at(*ms));
+                }
+                TimeOut { at: ms, server } => {
+                    now = START + ms;
+                    let outcome = teacher
+                        .question_tick(now)
+                        .unwrap_or_else(|| panic!("{}: no time-out", at(*ms)));
+                    assert!(!outcome.correct, "{}: wrong", at(*ms));
+                    assert_eq!(consequence(&outcome), *server, "{}: consequences", at(*ms));
+                }
+                Asked(id) => {
+                    let asked = teacher.question().map(|open| open.question.id.as_str());
+                    assert_eq!(asked, Some(*id), "{}: asked", at(now - START));
+                }
+                Stage(expected) => {
+                    let got = stage_text(&teacher.exam(now));
+                    assert_eq!(got, *expected, "{}: stage", at(now - START));
+                }
+                Hud(expected) => {
+                    let got = teacher.exam_hud(now).map(|stage| stage_text(&stage));
+                    assert_eq!(got.as_deref(), *expected, "{}: HUD", at(now - START));
+                }
+                Saved(expected) => {
+                    let exam = teacher
+                        .progress
+                        .world()
+                        .exams
+                        .last()
+                        .unwrap_or_else(|| panic!("{}: no exam saved", at(now - START)));
+                    let got = format!(
+                        "{}/{} {} {}",
+                        exam["right"],
+                        exam["total"],
+                        exam["type"].as_str().unwrap_or_default(),
+                        exam["minutes"]
+                    );
+                    assert_eq!(got, *expected, "{}: saved", at(now - START));
+                }
+                Auto(expected) => {
+                    assert_eq!(teacher.config.exam_auto, *expected, "{name}: examAuto");
+                }
+            }
+        }
     }
 }
 
@@ -862,6 +1325,18 @@ fn progress_file_keeps_the_original_shape() {
     written.heard("hold.quux");
     written.answered("break.bloop", true, 1_700_000_000_000);
     written.answered("hold.quux", false, 1_700_000_000_500);
+    let jump = phrase(&fixture_pack("en"), "jump");
+    let row = |correct: bool| ExamRow {
+        phrase: jump.clone(),
+        correct,
+        given: String::new(),
+    };
+    let exam = ExamResult {
+        minutes: 0.05,
+        kinds: "choice+typing".to_string(),
+        rows: vec![row(true), row(false)],
+    };
+    written.exam_done(&exam, 1_700_000_001_000);
     let older = Progress::parse(
         r#"{"worlds": {"server:example.org": {"heard": {"jump": 3}, "quiz": {"jump": [2, 1]},
             "exams": [{"at": 5, "minutes": 20.0, "type": "choice", "right": 1, "total": 2}]}},
@@ -879,7 +1354,8 @@ fn progress_file_keeps_the_original_shape() {
                     "correctAt": {"break.bloop": 1_700_000_000_000i64},
                     "heartsLost": 0,
                     "deaths": 0,
-                    "exams": []
+                    "exams": [{"at": 1_700_000_001_000i64, "minutes": 0.05, "type": "choice+typing",
+                        "right": 1, "total": 2}]
                 }},
                 "correctTotal": {"break.bloop": 1},
                 "lastCorrectAt": {"break.bloop": 1_700_000_000_000i64},
@@ -919,7 +1395,7 @@ fn config_file_keeps_names_defaults_and_unknown_keys() {
     .expect("the config parses");
     let written = config.to_json();
     #[rustfmt::skip]
-    let rows: [(&str, &str, Value); 11] = [
+    let rows: [(&str, &str, Value); 18] = [
         ("a number read as a float", "quizIntervalSeconds", json!(30.0)),
         ("a boolean written as a string", "muted", json!(true)),
         ("a key this port does not read", "laterSetting", json!([1, 2])),
@@ -931,6 +1407,13 @@ fn config_file_keeps_names_defaults_and_unknown_keys() {
         ("the angry teacher's streak", "angryAfterWrong", json!(5)),
         ("the jump cooldown", "jumpCooldownSeconds", json!(4.0)),
         ("the climate repeat", "climateRepeatSeconds", json!(0.0)),
+        ("the exam's minutes", "examMinutes", json!(20.0)),
+        ("the exam on its own", "examAuto", json!(true)),
+        ("exam questions with buttons", "examChoice", json!(true)),
+        ("exam questions to type", "examTyping", json!(true)),
+        ("no exam penalties", "examPenalties", json!(false)),
+        ("the tooltip line", "tooltipChinese", json!(true)),
+        ("the guide not shown yet", "guideShown", json!(false)),
     ];
     for (name, key, expected) in rows {
         assert_eq!(written.get(key), Some(&expected), "{name}: {key}");
@@ -1800,7 +2283,7 @@ fn settings_rows_go_round_or_stop_at_their_ends() {
         Shown,
     );
     #[rustfmt::skip]
-    let rows: [Row; 18] = [
+    let rows: [Row; 19] = [
         ("a switch flips", Page::Main, "enabled", |_| {}, &[1], Shown::Flag(true), Shown::Flag(false)),
         ("sound shows the voice on, and a click mutes it", Page::Main, "sound", |_| {}, &[1],
             Shown::Flag(true), Shown::Flag(false)),
@@ -1828,6 +2311,8 @@ fn settings_rows_go_round_or_stop_at_their_ends() {
         ("the rest mode shows its minutes", Page::Advanced, "learned_mode",
             |c| c.learned_mode = "rest".into(), &[1], Shown::Rest(60), choice("forever")),
         ("a topic", Page::Topics, "say_kills", |_| {}, &[-1], Shown::Flag(true), Shown::Flag(false)),
+        ("the exam's minutes go by five and stop at an hour", Page::Exam, "exam_minutes", |_| {}, &[30, -3],
+            text("20 min"), text("45 min")),
     ];
     for (name, page, row_name, change, clicks, before, after) in rows {
         let rows = settings(page, &pack);
@@ -1851,16 +2336,237 @@ fn settings_rows_go_round_or_stop_at_their_ends() {
     sound.cycle(&mut config, 1);
     assert!(config.muted, "the sound row writes muted");
     #[rustfmt::skip]
-    let pages: [(Page, &[&str]); 3] = [
+    let pages: [(Page, &[&str]); 4] = [
         (Page::Main, &["enabled", "hint_language", "speed", "volume", "sound", "repeat", "same_again",
             "text_scale", "english", "quiz_mode", "quiz_penalty", "quiz_interval", "quiz_answer"]),
         (Page::Advanced, &["portrait", "portrait_scale", "position", "learned_mode", "quiz_reward",
-            "quiz_pause", "angry_teacher", "angry_after", "backdrop"]),
+            "quiz_pause", "angry_teacher", "angry_after", "tooltip", "backdrop"]),
         (Page::Topics, &["say_movement", "say_combat", "say_blocks", "say_items", "say_world", "say_held",
             "say_kills", "say_damage"]),
+        (Page::Exam, &["exam_auto", "exam_minutes", "exam_choice", "exam_typing", "exam_penalties"]),
     ];
     for (page, names) in pages {
         let got: Vec<&str> = settings(page, &pack).iter().map(|row| row.name).collect();
         assert_eq!(got, names, "{page:?}: the rows for a German pack");
     }
+    type Link = (&'static str, fn(&mut Config), Option<&'static str>);
+    #[rustfmt::skip]
+    let links: [Link; 3] = [
+        ("the exam link shows the minutes", |_| {}, Some("20")),
+        ("as the original writes a number", |c| c.exam_minutes = 7.5, Some("7.5")),
+        ("and off without examAuto", |c| c.exam_auto = false, None),
+    ];
+    for (name, change, expected) in links {
+        let mut config = Config::default();
+        change(&mut config);
+        assert_eq!(exam_link(&config).as_deref(), expected, "{name}");
+    }
+}
+
+/// An invented `dictionary.json` for the fixture's phrases.
+const DICTIONARY: &str = r#"{"version": 1, "entries": {
+  "break.bloop": {"h": ["w.ich", "zack", "item|den"],
+    "n": [["conj", "zerbreche", "w.v_zerbrechen"], ["verb", "a", "b", "v_hauen"],
+          ["measure", "1", "2", "3", "m", "5"], []],
+    "f": [["Er zerbricht den Bloop.", "", "he"]]},
+  "use.zing": {"h": ["color.lime", "item"], "n": [], "f": []},
+  "hold.quux": {"h": [], "n": [], "f": []},
+  "pickup.quux": {"h": [], "n": [], "f": []},
+  "jump": {"h": [], "n": [], "f": []}
+}}"#;
+
+fn label_text(label: &Label) -> String {
+    match label {
+        Label::Key(key) => format!("key {key}"),
+        Label::Text(text) => text.clone(),
+        Label::Item { name, suffix } => {
+            let name = match name {
+                ItemName::Text(text) => text.clone(),
+                ItemName::Game { key, fallback } => format!("game {key} else {fallback}"),
+            };
+            suffix
+                .as_ref()
+                .map_or(name.clone(), |suffix| format!("{name} \u{B7} {suffix}"))
+        }
+    }
+}
+
+/// What the dictionary is asked.
+#[derive(Clone, Copy)]
+enum Look {
+    /// A tab in a world, needing this many right answers: the phrase ids in order.
+    Tab {
+        world: &'static str,
+        need: i32,
+        all: bool,
+    },
+    /// The search over the "all worlds" tab in [`WORLD`].
+    Search(&'static str),
+    /// The detail pane of a phrase with this translation language, line by line.
+    Detail(&'static str, &'static str),
+    /// Only its words.
+    Words(&'static str, &'static str),
+}
+
+#[test]
+fn the_dictionary_lists_learned_phrases_finds_them_and_explains_them() {
+    const ELSEWHERE: &str = "save:Anderswo:1";
+    let pack = fixture_pack("en");
+    let dictionary = Dictionary::parse(DICTIONARY).expect("the fixture dictionary parses");
+    let mut progress = Progress::default();
+    progress.switch_world(WORLD);
+    progress.answered("jump", true, 100);
+    progress.answered("break.bloop", true, 200);
+    progress.answered("hold.quux", true, 300);
+    progress.answered("hold.zing", true, 350);
+    progress.answered("pickup.quux", false, 360);
+    progress.switch_world(ELSEWHERE);
+    progress.answered("jump", true, 400);
+    progress.answered("gone.phrase", true, 500);
+    #[rustfmt::skip]
+    let rows: [(&str, Look, &[&str]); 13] = [
+        ("all worlds: phrases with an entry, the newest right answer anywhere first",
+            Look::Tab { world: WORLD, need: 1, all: true }, &["jump", "hold.quux", "break.bloop"]),
+        ("this world: learned here, by this world's last right answer",
+            Look::Tab { world: WORLD, need: 1, all: false }, &["hold.quux", "break.bloop", "jump"]),
+        ("two right answers: all worlds count them together", Look::Tab { world: WORLD, need: 2, all: true },
+            &["jump"]),
+        ("and this world needs both here", Look::Tab { world: WORLD, need: 2, all: false }, &[]),
+        ("another world's tab", Look::Tab { world: ELSEWHERE, need: 1, all: false }, &["jump"]),
+        ("an empty search shows all", Look::Search(""), &["jump", "hold.quux", "break.bloop"]),
+        ("the search ignores case and the spaces around it", Look::Search("  QUUX "), &["hold.quux"]),
+        ("the text", Look::Search("zerbreche"), &["break.bloop"]),
+        ("the translation", Look::Search("i hop"), &["jump"]),
+        ("the words: the pack's keys, colours, the thing's name with its article, text as it is",
+            Look::Detail("break.bloop", "en"), &[
+            "Ich: key zhnarrator_xx.dict.w.ich",
+            "zerbreche: zack",
+            "den: bloop \u{B7} den",
+            "Bloop: -",
+            "note zhnarrator_xx.dict.note.conj: zerbreche, key zhnarrator_xx.dict.w.v_zerbrechen",
+            "note zhnarrator_xx.dict.note.verb: a, b, key zhnarrator_xx.dict.w.v_hauen",
+            "note zhnarrator_xx.dict.note.measure: 1, 2, 3, key zhnarrator_xx.dict.measure.m, 5",
+            "form Er zerbricht den Bloop. () key zhnarrator_xx.dict.form.he",
+        ]),
+        ("in a language the pack has no words in, the game names the thing, else the pack's word",
+            Look::Words("break.bloop", "fr"), &[
+            "Ich: key zhnarrator_xx.dict.w.ich",
+            "zerbreche: zack",
+            "den: game bloop else bloop \u{B7} den",
+            "Bloop: -",
+        ]),
+        ("with no word for it, the game names it, else its key; a colour is the game's",
+            Look::Detail("use.zing", "en"), &[
+            "J': key color.minecraft.lime",
+            "zing: game zing else zing",
+            "den: -",
+            "Zing: -",
+        ]),
+        ("no entry, no detail", Look::Detail("hold.zing", "en"), &["none"]),
+    ];
+    for (name, look, expected) in rows {
+        let got: Vec<String> = match look {
+            Look::Tab { world, need, all } => {
+                progress.switch_world(world);
+                let config = Config {
+                    learned_after_correct: need,
+                    ..Config::default()
+                };
+                let learned = dictionary.learned(&pack, &progress, &config);
+                let tab = if all { learned.all } else { learned.this_world };
+                tab.iter().map(|p| p.id.clone()).collect()
+            }
+            Look::Search(query) => {
+                progress.switch_world(WORLD);
+                let learned = dictionary.learned(&pack, &progress, &Config::default());
+                search(&learned.all, query)
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect()
+            }
+            Look::Detail(id, language) | Look::Words(id, language) => {
+                let asked = phrase(&pack, id);
+                let words_only = if matches!(look, Look::Words(..)) {
+                    asked.parts.len()
+                } else {
+                    usize::MAX
+                };
+                match dictionary.detail(&pack, &asked, language) {
+                    None => vec!["none".to_string()],
+                    Some(detail) => {
+                        let words = detail.words.iter().map(|(part, hint)| {
+                            let hint = hint.as_ref().map_or("-".to_string(), label_text);
+                            format!("{}: {hint}", part.text)
+                        });
+                        let notes = detail.notes.iter().map(|note| {
+                            let args: Vec<String> = note.args.iter().map(label_text).collect();
+                            format!("note {}: {}", note.key, args.join(", "))
+                        });
+                        let forms = detail.forms.iter().map(|form| {
+                            format!("form {} ({}) key {}", form.text, form.reading, form.label)
+                        });
+                        words.chain(notes).chain(forms).take(words_only).collect()
+                    }
+                }
+            }
+        };
+        assert_eq!(got, expected, "{name}");
+    }
+}
+
+#[test]
+fn the_guide_opens_once_in_the_first_world_then_hints() {
+    // (name, client ticks in the world, a screen open, teacher on, shown before, cue, shown after)
+    type Row = (&'static str, u32, bool, bool, bool, Option<GuideCue>, bool);
+    #[rustfmt::skip]
+    let rows: [Row; 6] = [
+        ("3 s into the first world it opens", 60, false, true, false, Some(GuideCue::Open), true),
+        ("not before", 59, false, true, false, None, false),
+        ("nor after", 61, false, true, false, None, false),
+        ("once shown, the hint", 60, false, true, true, Some(GuideCue::Hint), true),
+        ("a screen open: the hint, and a later world opens it", 60, true, true, false, Some(GuideCue::Hint), false),
+        ("the teacher off: nothing", 60, false, false, false, None, false),
+    ];
+    for (name, ticks, screen_open, enabled, shown, cue, shown_after) in rows {
+        let mut config = Config {
+            enabled,
+            guide_shown: shown,
+            ..Config::default()
+        };
+        assert_eq!(
+            guide_cue(ticks, screen_open, &mut config),
+            cue,
+            "{name}: cue"
+        );
+        assert_eq!(config.guide_shown, shown_after, "{name}: guideShown");
+    }
+    #[rustfmt::skip]
+    let angry: [(&str, &str, i32, (&str, i32)); 4] = [
+        ("he throws things down", "drop", 5, ("drop", 5)),
+        ("he deletes them", "delete", 3, ("delete", 3)),
+        ("he is never angry, and the count is at least one", "off", 0, ("off", 1)),
+        ("an unknown mode reads as drop", "shout", 5, ("drop", 5)),
+    ];
+    for (name, mode, after, expected) in angry {
+        let config = Config {
+            angry_teacher: mode.to_string(),
+            angry_after_wrong: after,
+            ..Config::default()
+        };
+        assert_eq!(angry_page(&config), expected, "{name}");
+    }
+    let pages: Vec<(&str, Option<i32>)> = GUIDE_PAGES
+        .iter()
+        .map(|page| (page.name(), page.portrait_frame()))
+        .collect();
+    assert_eq!(
+        pages,
+        [
+            ("keys", None),
+            ("questions", None),
+            ("consequences", None),
+            ("angry", Some(5))
+        ],
+        "the pages in order, the angry one with the angry face"
+    );
 }

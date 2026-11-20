@@ -375,7 +375,14 @@ fn world_tick(
             open_question(host, io, teacher, game)
         }
         Some(QuizEvent::Resume) => open_question(host, io, teacher, game),
-        Some(QuizEvent::Dropped) | None => false,
+        // The exam's chat lines and result screen come with the exam's client lane.
+        Some(
+            QuizEvent::Dropped
+            | QuizEvent::ExamBegins { .. }
+            | QuizEvent::ExamEmpty
+            | QuizEvent::ExamOver(_),
+        )
+        | None => false,
     }
 }
 

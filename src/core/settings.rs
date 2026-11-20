@@ -1,21 +1,25 @@
-//! The settings pages (Java `NarratorSettingsScreen`, `NarratorAdvancedScreen` and
-//! `NarratorTopicsScreen`): which rows each page has for a German pack, what each row shows, and
-//! how a click moves its value. Choices and switches go round; numbers stop at their ends.
+//! The settings pages (Java `NarratorSettingsScreen`, `NarratorAdvancedScreen`,
+//! `NarratorTopicsScreen` and `ExamScreen`): which rows each page has for a German pack, what each
+//! row shows, and how a click moves its value. Choices and switches go round; numbers stop at
+//! their ends.
 //!
-//! Left out: rows for packs with readings or several looks, voice answers and the exam page, and
-//! rows of features the port does not have (the score counter, the question timer line, the
-//! learned jingle, tooltips, and the font, which is the same either way for German). The original
-//! offers the `speech` quiz mode; here a `speech` config asks with buttons, so the row shows it as
-//! the button mode and steps on from there.
+//! Left out: rows for packs with readings or several looks, voice answers (and the exam's voice
+//! row), and rows of features the port does not have (the score counter, the question timer line,
+//! the learned jingle, and the font, which is the same either way for German). The original offers
+//! the `speech` quiz mode; here a `speech` config asks with buttons, so the row shows it as the
+//! button mode and steps on from there. The exam page's Start or Stop button is not a row: see
+//! [`super::Teacher::exam`].
 use super::config::Config;
 use super::pack::Pack;
 
-/// A settings page. The main page links to the advanced one, which links to the topics.
+/// A settings page. The main page links to the exam page ([`exam_link`]) and the advanced one,
+/// which links to the topics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Main,
     Advanced,
     Topics,
+    Exam,
 }
 
 /// What a row shows for its value.
@@ -177,6 +181,11 @@ pub fn settings(page: Page, pack: &Pack) -> Vec<Setting> {
                 |c| c.angry_after_wrong.max(1) as f32,
                 |c, v| c.angry_after_wrong = v.round() as i32,
             ),
+            switch(
+                "tooltip",
+                |c| c.tooltip_chinese,
+                |c, v| c.tooltip_chinese = v,
+            ),
             switch("backdrop", |c| c.hud_backdrop, |c, v| c.hud_backdrop = v),
         ],
         Page::Topics => vec![
@@ -193,7 +202,32 @@ pub fn settings(page: Page, pack: &Pack) -> Vec<Setting> {
             switch("say_kills", |c| c.say_kills, |c, v| c.say_kills = v),
             switch("say_damage", |c| c.say_damage, |c, v| c.say_damage = v),
         ],
+        Page::Exam => vec![
+            switch("exam_auto", |c| c.exam_auto, |c, v| c.exam_auto = v),
+            number(
+                "exam_minutes",
+                even(5.0, 60.0, 5.0, " min"),
+                |c| c.exam_minutes,
+                |c, v| c.exam_minutes = v,
+            ),
+            switch("exam_choice", |c| c.exam_choice, |c, v| c.exam_choice = v),
+            switch("exam_typing", |c| c.exam_typing, |c, v| c.exam_typing = v),
+            switch(
+                "exam_penalties",
+                |c| c.exam_penalties,
+                |c, v| c.exam_penalties = v,
+            ),
+        ],
     }
+}
+
+/// The main page's link to the exam page: with `examAuto` on, the minutes as the original writes
+/// a number, for "Exam: every N min..." (`options.exam.on`); `None` for "Exam: off..."
+/// (`options.exam.off`).
+pub fn exam_link(config: &Config) -> Option<String> {
+    config
+        .exam_auto
+        .then(|| format(f64::from(config.exam_minutes)))
 }
 
 fn main_page(pack: &Pack) -> Vec<Setting> {

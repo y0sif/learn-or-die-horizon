@@ -3,7 +3,8 @@
 //!
 //! Modes: `choice` asks with buttons, `typing` asks to type, `mixed` rolls one in three for
 //! typing. Voice answers are not ported, so `speech`, and the voice third of `mixed`, ask with
-//! buttons.
+//! buttons. While an exam asks its questions they take the place of normal ones; see
+//! [`super::exam`].
 //!
 //! Schedule: a question comes every `quizIntervalSeconds` of play. Time with a screen open, or a
 //! tick gap over a second, does not count. Nothing is asked before the teacher said something in
@@ -16,6 +17,7 @@
 //! suspends the question with the time left (at least 1 s) and what was typed; when no screen is
 //! open any more it comes back with them and a new lockout.
 use super::config::Config;
+use super::exam::{self, Exam, ExamResult};
 use super::pack::{Pack, Phrase};
 use super::progress::Progress;
 use super::rng::Rng;
@@ -36,7 +38,7 @@ const OPTIONS: usize = 4;
 const NOUNS_ONLY_CHANCE: f64 = 0.4;
 
 /// What the game layer does after a quiz tick.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum QuizEvent {
     /// A new question: play the ding and open the question screen.
     Ask,
@@ -44,6 +46,13 @@ pub enum QuizEvent {
     Resume,
     /// The question screen was replaced by another one: the question is dropped, no penalty.
     Dropped,
+    /// The exam's questions begin: say "Exam time! N questions." The first comes 1 s later.
+    ExamBegins { questions: usize },
+    /// The exam's time is up, but nothing came up to ask about: say so. The exam is off.
+    ExamEmpty,
+    /// The exam is over: say "N of M right" and show the result screen, which pauses the game.
+    /// Progress has the result already.
+    ExamOver(ExamResult),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -136,6 +145,8 @@ pub(crate) struct Answer {
     pub(crate) correct: bool,
     /// A typed answer: what was typed (stripped) and its verdict.
     pub(crate) typed: Option<(String, Verdict)>,
+    /// Rewards and penalties apply: always, but for an exam answer only with its penalties.
+    pub(crate) consequences: bool,
 }
 
 #[derive(Debug, Default)]
@@ -157,16 +168,27 @@ pub(crate) struct Quiz {
     frown_until: i64,
     wrong_streak: i32,
     angry_until: i64,
+    exam: Exam,
 }
 
 impl Quiz {
-    /// A new world or dimension: the interval starts again and any open question is dropped.
+    /// A new world or dimension: the interval starts again, and any open question and any exam
+    /// are dropped.
     pub(crate) fn on_joined_world(&mut self, now: i64, progress: &Progress) {
         self.last_quiz_at = now;
         self.last_tick_at = now;
         self.nothing_to_ask = progress.world().heard.is_empty();
         self.last_pick_try_at = 0;
         self.open = None;
+        self.exam.stop();
+    }
+
+    pub(crate) fn exam(&self) -> &Exam {
+        &self.exam
+    }
+
+    pub(crate) fn exam_mut(&mut self) -> &mut Exam {
+        &mut self.exam
     }
 
     pub(crate) fn open(&self) -> Option<&OpenQuestion> {
@@ -223,6 +245,7 @@ impl Quiz {
         self.last_tick_at = now;
         if gap > 0 && (input.screen_open || gap > 1000) {
             self.last_quiz_at += gap;
+            self.exam.add_back(gap, now);
         }
         if let Some(last) = self.last_health
             && input.health < last - 0.5
@@ -265,22 +288,35 @@ impl Quiz {
             None => {}
         }
 
-        if !config.on() || input.screen_open || config.quiz_mode == "off" {
+        if !config.on() || input.screen_open {
             return None;
         }
-        if self.nothing_to_ask {
-            if now - self.last_pick_try_at < PICK_RETRY_MS {
+        if let Some(event) = self.exam_tick(pack, config, progress, rng, now) {
+            return Some(event);
+        }
+        let asking = self.exam.asking();
+        if asking {
+            if self.exam.current().is_none() || now - self.last_quiz_at < exam::GAP_MS {
                 return None;
             }
-            self.last_pick_try_at = now;
-            if has_candidates(pack, config, progress, now) {
-                self.nothing_to_ask = false;
-                self.last_quiz_at = now;
+        } else {
+            if config.quiz_mode == "off" {
+                return None;
             }
-            return None;
-        }
-        if ((now - self.last_quiz_at) as f32) < config.quiz_interval_seconds * 1000.0 {
-            return None;
+            if self.nothing_to_ask {
+                if now - self.last_pick_try_at < PICK_RETRY_MS {
+                    return None;
+                }
+                self.last_pick_try_at = now;
+                if has_candidates(pack, config, progress, now) {
+                    self.nothing_to_ask = false;
+                    self.last_quiz_at = now;
+                }
+                return None;
+            }
+            if ((now - self.last_quiz_at) as f32) < config.quiz_interval_seconds * 1000.0 {
+                return None;
+            }
         }
         if let Some(reason) = self.calm_reason(input, now) {
             let asked_anyway = config.quiz_pause_game
@@ -290,16 +326,26 @@ impl Quiz {
                 return None;
             }
         }
-        let typing = match config.quiz_mode.as_str() {
-            "typing" => true,
-            "mixed" => rng.below(3) == 1,
-            _ => false,
+        let typing = if asking {
+            self.exam.kind(rng) == QuestionKind::Typing
+        } else {
+            match config.quiz_mode.as_str() {
+                "typing" => true,
+                "mixed" => rng.below(3) == 1,
+                _ => false,
+            }
         };
-        let Some(question) = pick(pack, config, progress, now, rng) else {
+        let question = if asking {
+            self.exam.current().cloned()
+        } else {
+            pick(pack, config, progress, now, rng)
+        };
+        let Some(question) = question else {
             self.nothing_to_ask = true;
             self.last_pick_try_at = now;
             return None;
         };
+        self.exam.on_asked(&question.id);
         let (kind, options, seconds) = if typing {
             let seconds = MIN_TYPING_SECONDS.max(config.quiz_answer_seconds * 2.0);
             (QuestionKind::Typing, Vec::new(), seconds)
@@ -322,6 +368,41 @@ impl Quiz {
             clock: Clock::showing(now, total_ms, kind),
         });
         Some(QuizEvent::Ask)
+    }
+
+    /// The exam's own steps, before any question: an automatic exam dropped when `examAuto` went
+    /// off, one started when none runs, the questions begun when the countdown is over, and the
+    /// result 2.5 s after the last answer.
+    fn exam_tick(
+        &mut self,
+        pack: &Pack,
+        config: &Config,
+        progress: &Progress,
+        rng: &mut Rng,
+        now: i64,
+    ) -> Option<QuizEvent> {
+        if self.exam.playing() && self.exam.auto() && !config.exam_auto {
+            self.exam.stop();
+        }
+        if self.exam.is_off() && config.exam_auto && config.quiz_mode != "off" {
+            self.exam.start(progress.world(), config, true, now);
+        }
+        if self.exam.due(now) {
+            let questions = self.exam.begin(pack, progress.world(), rng);
+            if questions == 0 {
+                return Some(QuizEvent::ExamEmpty);
+            }
+            self.last_quiz_at = now - exam::GAP_MS + exam::FIRST_AFTER_MS;
+            return Some(QuizEvent::ExamBegins { questions });
+        }
+        if self.exam.asking()
+            && self.exam.current().is_none()
+            && now - self.last_quiz_at >= exam::GAP_MS
+        {
+            self.last_quiz_at = now;
+            return Some(QuizEvent::ExamOver(self.exam.finish()));
+        }
+        None
     }
 
     /// Why the player is not calm, if they are not: `dead`, `busy` (mining, attacking or using an
@@ -446,6 +527,7 @@ impl Quiz {
         let open = self.open.take()?;
         self.last_quiz_at = now;
         self.last_tick_at = now;
+        let consequences = self.exam.on_answer(&open.question, correct, &self.given);
         if !self.given.is_empty() {
             self.last_active_at = now;
         }
@@ -459,6 +541,7 @@ impl Quiz {
             question: open.question,
             correct,
             typed,
+            consequences,
         })
     }
 }

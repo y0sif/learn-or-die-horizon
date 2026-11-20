@@ -1,7 +1,8 @@
 //! The learning state (Java `Progress`): what was heard and answered in each world, and the right
 //! answers across all worlds. The file keeps the original's shape and field names:
 //! `{"worlds": {"<key>": {"heard", "quiz", "correctAt", "heartsLost", "deaths", "exams"}},
-//! "correctTotal", "lastCorrectAt", "deaths"}`, with `quiz` values as `[asked, correct]`.
+//! "correctTotal", "lastCorrectAt", "deaths"}`, with `quiz` values as `[asked, correct]` and each
+//! exam as `{"at", "minutes", "type", "right", "total"}`.
 //!
 //! Invariants: every count is per world except `correctTotal`, `lastCorrectAt` and `deaths`
 //! (hardcore deaths). `heartsLost` comes back to 0 on a death.
@@ -9,6 +10,7 @@
 //! Until [`Progress::switch_world`] names a world, counts go to a detached world that is never
 //! saved.
 use super::config::Config;
+use super::exam::ExamResult;
 use super::gson::{self, JsonObject, field};
 use mod_api::serde_json::{self, Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -39,7 +41,8 @@ pub struct World {
     pub correct_at: BTreeMap<String, i64>,
     pub hearts_lost: i32,
     pub deaths: i32,
-    /// Exam results, kept as written: the exam is not ported yet.
+    /// Exam results, oldest first, kept as written: `{"at", "minutes", "type", "right",
+    /// "total"}`.
     pub exams: Vec<Value>,
 }
 
@@ -215,6 +218,19 @@ impl Progress {
             self.last_correct_at.insert(id.to_string(), now);
             *self.correct_total.entry(id.to_string()).or_insert(0) += 1;
         }
+        self.save_now = true;
+    }
+
+    /// An exam is over: its result goes into this world's list, and asks for a save.
+    pub(crate) fn exam_done(&mut self, result: &ExamResult, now: i64) {
+        let entry = json!({
+            "at": now,
+            "minutes": gson::float_value(result.minutes),
+            "type": result.kinds,
+            "right": result.right(),
+            "total": result.total(),
+        });
+        self.world_mut().exams.push(entry);
         self.save_now = true;
     }
 
