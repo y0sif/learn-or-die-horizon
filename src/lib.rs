@@ -4,6 +4,8 @@
 //! docs/modding/src/concepts/injections.md.
 use mod_api::{self, Hooks, PlayerLoggedInEvent, ServerHost, Text};
 
+pub mod core;
+
 #[derive(Default)]
 struct Mod;
 

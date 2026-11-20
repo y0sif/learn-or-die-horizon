@@ -1,0 +1,464 @@
+//! The choice quiz (Java `QuizManager` and `QuizScreen`, the choice path): when a question is
+//! due, which phrase is asked, its four options, and the clock of the open question.
+//!
+//! Schedule: a question comes every `quizIntervalSeconds` of play. Time with a screen open, or a
+//! tick gap over a second, does not count. Nothing is asked before the teacher said something in
+//! this world, and the first question comes a full interval after that. The player must be calm;
+//! in singleplayer with `quizPauseGame` most reasons are waived, but never `afk`, `dead` or `busy`.
+//!
+//! Clock: answers are ignored for the first 700 ms; time-out counts as wrong. Esc suspends the
+//! question with the time left (at least 1 s); when no screen is open any more it comes back with
+//! that time and a new 700 ms lockout.
+use super::config::Config;
+use super::pack::{Pack, Phrase};
+use super::progress::Progress;
+use super::rng::Rng;
+use super::teacher::WorldTick;
+
+const CALM_AFTER_DAMAGE_MS: i64 = 5000;
+const AFK_AFTER_MS: i64 = 20_000;
+const BUSY_MS: i64 = 1500;
+const PICK_RETRY_MS: i64 = 1000;
+const ACCEPT_AFTER_MS: i64 = 700;
+const MIN_SUSPENDED_MS: i64 = 1000;
+const FROWN_MS: i64 = 2500;
+const OPTIONS: usize = 4;
+const NOUNS_ONLY_CHANCE: f64 = 0.4;
+
+/// What the game layer does after a quiz tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuizEvent {
+    /// A new question: play the ding and open the question screen.
+    Ask,
+    /// The suspended question is back: open the question screen again.
+    Resume,
+    /// The question screen was replaced by another one: the question is dropped, no penalty.
+    Dropped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Clock {
+    Showing {
+        deadline: i64,
+        accept_after: i64,
+        total_ms: i64,
+    },
+    Suspended {
+        remaining_ms: i64,
+    },
+}
+
+impl Clock {
+    fn showing(now: i64, total_ms: i64) -> Clock {
+        Clock::Showing {
+            deadline: now + total_ms,
+            accept_after: now + ACCEPT_AFTER_MS,
+            total_ms,
+        }
+    }
+}
+
+/// The question being asked, with its options in screen order (keys 1 to 4).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenQuestion {
+    pub question: Phrase,
+    pub options: Vec<Phrase>,
+    /// The English prompt is hidden and the phrase is played instead: its `en` is blank or the
+    /// same as its text.
+    pub listening: bool,
+    clock: Clock,
+}
+
+impl OpenQuestion {
+    /// Suspended by Esc: the screen is closed until the question comes back.
+    pub fn is_suspended(&self) -> bool {
+        matches!(self.clock, Clock::Suspended { .. })
+    }
+
+    /// Time left to answer, in ms.
+    pub fn left_ms(&self, now: i64) -> i64 {
+        match self.clock {
+            Clock::Showing { deadline, .. } => (deadline - now).max(0),
+            Clock::Suspended { remaining_ms } => remaining_ms,
+        }
+    }
+
+    /// The timer bar: the share of this screen's time that is left, from 1 to 0.
+    pub fn fraction_left(&self, now: i64) -> f32 {
+        match self.clock {
+            Clock::Showing { total_ms, .. } if total_ms > 0 => {
+                (self.left_ms(now) as f32 / total_ms as f32).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        }
+    }
+}
+
+/// A finished question, for the teacher to record and say.
+pub(crate) struct Answer {
+    pub(crate) question: Phrase,
+    pub(crate) correct: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Quiz {
+    last_quiz_at: i64,
+    last_tick_at: i64,
+    last_damage_at: i64,
+    last_active_at: i64,
+    last_health: Option<f32>,
+    last_position: [f64; 3],
+    last_yaw: f32,
+    last_pitch: f32,
+    busy_until: i64,
+    nothing_to_ask: bool,
+    last_pick_try_at: i64,
+    open: Option<OpenQuestion>,
+    given: String,
+    hop_at: i64,
+    frown_until: i64,
+}
+
+impl Quiz {
+    /// A new world or dimension: the interval starts again and any open question is dropped.
+    pub(crate) fn on_joined_world(&mut self, now: i64, progress: &Progress) {
+        self.last_quiz_at = now;
+        self.last_tick_at = now;
+        self.nothing_to_ask = progress.world().heard.is_empty();
+        self.last_pick_try_at = 0;
+        self.open = None;
+    }
+
+    pub(crate) fn open(&self) -> Option<&OpenQuestion> {
+        self.open.as_ref()
+    }
+
+    /// When the last answer was right, for the portrait's hop.
+    pub(crate) fn hop_at(&self) -> i64 {
+        self.hop_at
+    }
+
+    /// The teacher frowns for 2.5 s after a wrong answer.
+    pub(crate) fn frowning(&self, now: i64) -> bool {
+        now < self.frown_until
+    }
+
+    /// One client tick in a world, not paused.
+    pub(crate) fn tick(
+        &mut self,
+        input: &WorldTick<'_>,
+        pack: &Pack,
+        config: &Config,
+        progress: &Progress,
+        rng: &mut Rng,
+    ) -> Option<QuizEvent> {
+        let now = input.now;
+        let gap = if self.last_tick_at == 0 {
+            0
+        } else {
+            now - self.last_tick_at
+        };
+        self.last_tick_at = now;
+        if gap > 0 && (input.screen_open || gap > 1000) {
+            self.last_quiz_at += gap;
+        }
+        if let Some(last) = self.last_health
+            && input.health < last - 0.5
+        {
+            self.last_damage_at = now;
+        }
+        self.last_health = Some(input.health);
+        let moved: f64 = input
+            .position
+            .iter()
+            .zip(self.last_position)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        if moved > 1.0e-4 || input.yaw != self.last_yaw || input.pitch != self.last_pitch {
+            self.last_active_at = now;
+        }
+        self.last_position = input.position;
+        self.last_yaw = input.yaw;
+        self.last_pitch = input.pitch;
+
+        let clock = self.open.as_ref().map(|open| open.clock);
+        match clock {
+            Some(Clock::Suspended { remaining_ms }) => {
+                if input.screen_open {
+                    return None;
+                }
+                if let Some(open) = &mut self.open {
+                    open.clock = Clock::showing(now, remaining_ms);
+                }
+                return Some(QuizEvent::Resume);
+            }
+            Some(Clock::Showing { .. }) => {
+                if input.question_screen_open {
+                    return None;
+                }
+                self.open = None;
+                self.last_quiz_at = now;
+                return Some(QuizEvent::Dropped);
+            }
+            None => {}
+        }
+
+        if !config.on() || input.screen_open || config.quiz_mode == "off" {
+            return None;
+        }
+        if self.nothing_to_ask {
+            if now - self.last_pick_try_at < PICK_RETRY_MS {
+                return None;
+            }
+            self.last_pick_try_at = now;
+            if has_candidates(pack, config, progress, now) {
+                self.nothing_to_ask = false;
+                self.last_quiz_at = now;
+            }
+            return None;
+        }
+        if ((now - self.last_quiz_at) as f32) < config.quiz_interval_seconds * 1000.0 {
+            return None;
+        }
+        if let Some(reason) = self.calm_reason(input, now) {
+            let asked_anyway = config.quiz_pause_game
+                && input.singleplayer
+                && !matches!(reason, "afk" | "dead" | "busy");
+            if !asked_anyway {
+                return None;
+            }
+        }
+        let Some(question) = pick(pack, config, progress, now, rng) else {
+            self.nothing_to_ask = true;
+            self.last_pick_try_at = now;
+            return None;
+        };
+        let options: Vec<Phrase> = choose_options(pack, &question, rng)
+            .into_iter()
+            .cloned()
+            .collect();
+        self.given.clear();
+        self.last_quiz_at = now;
+        let total_ms = (config.quiz_answer_seconds * 1000.0) as i64;
+        self.open = Some(OpenQuestion {
+            listening: question.en.trim().is_empty() || question.en == question.text,
+            question,
+            options,
+            clock: Clock::showing(now, total_ms),
+        });
+        Some(QuizEvent::Ask)
+    }
+
+    /// Why the player is not calm, if they are not: `dead`, `busy` (mining, attacking or using an
+    /// item, and 1.5 s after), `hurt` (damage in the last 5 s), `sleep`, `vehicle`, `water`, `air`
+    /// or `afk` (no move or look for 20 s).
+    fn calm_reason(&mut self, input: &WorldTick<'_>, now: i64) -> Option<&'static str> {
+        if input.dead {
+            return Some("dead");
+        }
+        if input.breaking.is_some() || input.attack_down || input.using_item {
+            self.busy_until = now + BUSY_MS;
+            return Some("busy");
+        }
+        if now < self.busy_until {
+            Some("busy")
+        } else if now - self.last_damage_at <= CALM_AFTER_DAMAGE_MS {
+            Some("hurt")
+        } else if input.sleeping {
+            Some("sleep")
+        } else if input.in_vehicle {
+            Some("vehicle")
+        } else if input.in_water {
+            Some("water")
+        } else if !input.on_ground || input.fall_flying {
+            Some("air")
+        } else if now - self.last_active_at >= AFK_AFTER_MS {
+            Some("afk")
+        } else {
+            None
+        }
+    }
+
+    /// Picks option `index` (key `index + 1`). Ignored in the lockout and while suspended.
+    pub(crate) fn choose(&mut self, index: usize, now: i64) -> Option<Answer> {
+        let open = self.open.as_ref()?;
+        let Clock::Showing { accept_after, .. } = open.clock else {
+            return None;
+        };
+        if now < accept_after {
+            return None;
+        }
+        let option = open.options.get(index)?;
+        let correct = option.id == open.question.id;
+        self.given = option.bare().to_string();
+        self.finish(correct, now)
+    }
+
+    /// The screen's tick: time-out answers wrong.
+    pub(crate) fn screen_tick(&mut self, now: i64) -> Option<Answer> {
+        let clock = self.open.as_ref()?.clock;
+        match clock {
+            Clock::Showing { deadline, .. } if now >= deadline => self.finish(false, now),
+            _ => None,
+        }
+    }
+
+    /// Esc: suspends the question with the time left. False when no question is showing.
+    pub(crate) fn suspend(&mut self, now: i64) -> bool {
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        let Clock::Showing { deadline, .. } = open.clock else {
+            return false;
+        };
+        open.clock = Clock::Suspended {
+            remaining_ms: (deadline - now).max(MIN_SUSPENDED_MS),
+        };
+        true
+    }
+
+    fn finish(&mut self, correct: bool, now: i64) -> Option<Answer> {
+        let open = self.open.take()?;
+        self.last_quiz_at = now;
+        self.last_tick_at = now;
+        if !self.given.is_empty() {
+            self.last_active_at = now;
+        }
+        self.given.clear();
+        if correct {
+            self.hop_at = now;
+        } else {
+            self.frown_until = now + FROWN_MS;
+        }
+        Some(Answer {
+            question: open.question,
+            correct,
+        })
+    }
+}
+
+/// Phrases that may be asked, with their weights, and the fallback: the recently asked phrase
+/// asked longest ago. A candidate was heard in this world, is not a fragment and is not resting.
+/// Phrases asked within `quizRetryAfterSeconds` are only the fallback; the others weigh
+/// `(1 + 2 wrong) / (1 + correct) * min(heard, 5)`.
+fn pools<'a>(
+    pack: &'a Pack,
+    config: &Config,
+    progress: &Progress,
+    now: i64,
+) -> (Vec<(&'a Phrase, f64)>, Option<&'a Phrase>) {
+    let world = progress.world();
+    let mut fresh = Vec::new();
+    let mut recent: Option<(&Phrase, i64)> = None;
+    for phrase in pack.phrases() {
+        let heard = world.heard.get(&phrase.id).copied().unwrap_or(0);
+        if phrase.is_fragment() || heard == 0 || progress.rest_left(&phrase.id, now, config) > 0 {
+            continue;
+        }
+        let since = progress.since_asked_ms(&phrase.id, now);
+        if (since as f32) < config.quiz_retry_after_seconds * 1000.0 {
+            if recent.is_none_or(|(_, longest)| since > longest) {
+                recent = Some((phrase, since));
+            }
+        } else {
+            let correct = progress.correct(&phrase.id);
+            let wrong = progress.asked(&phrase.id) - correct;
+            let weight =
+                f64::from(1 + wrong * 2) / f64::from(1 + correct) * f64::from(heard.min(5));
+            fresh.push((phrase, weight));
+        }
+    }
+    (fresh, recent.map(|(phrase, _)| phrase))
+}
+
+fn has_candidates(pack: &Pack, config: &Config, progress: &Progress, now: i64) -> bool {
+    let (fresh, recent) = pools(pack, config, progress, now);
+    !fresh.is_empty() || recent.is_some()
+}
+
+/// The question: a weighted pick from the candidates. When they mix nouns (`hold`) and sentences,
+/// 40% of picks look at the nouns only.
+fn pick(
+    pack: &Pack,
+    config: &Config,
+    progress: &Progress,
+    now: i64,
+    rng: &mut Rng,
+) -> Option<Phrase> {
+    let (mut pool, recent) = pools(pack, config, progress, now);
+    if pool.is_empty() {
+        return recent.cloned();
+    }
+    let nouns = pool
+        .iter()
+        .filter(|(phrase, _)| phrase.action == "hold")
+        .count();
+    if nouns > 0 && nouns < pool.len() && rng.next_f64() < NOUNS_ONLY_CHANCE {
+        pool.retain(|(phrase, _)| phrase.action == "hold");
+    }
+    let total: f64 = pool.iter().map(|(_, weight)| weight).sum();
+    let mut roll = rng.next_f64() * total;
+    for (phrase, weight) in &pool {
+        roll -= weight;
+        if roll <= 0.0 {
+            return Some(Phrase::clone(phrase));
+        }
+    }
+    pool.last().map(|(phrase, _)| Phrase::clone(phrase))
+}
+
+/// Four options with distinct texts, the question among them, in random order. For a sentence
+/// about a thing, first other sentences about the same thing (so the verb decides), then phrases
+/// with the same action, then any phrase that is not a fragment.
+pub(crate) fn choose_options<'a>(
+    pack: &'a Pack,
+    question: &'a Phrase,
+    rng: &mut Rng,
+) -> Vec<&'a Phrase> {
+    let mut chosen = vec![question];
+    if let Some(key) = &question.key
+        && question.action != "hold"
+        && !question.is_fragment()
+    {
+        let mut same_thing: Vec<&Phrase> = pack
+            .phrases()
+            .iter()
+            .filter(|p| {
+                p.key.as_ref() == Some(key)
+                    && p.action != question.action
+                    && p.action != "hold"
+                    && !p.is_fragment()
+            })
+            .collect();
+        rng.shuffle(&mut same_thing);
+        add_distinct(&mut chosen, &same_thing, false);
+    }
+    let mut same_action: Vec<&Phrase> = pack
+        .by_action(&question.action)
+        .filter(|p| p.id != question.id)
+        .collect();
+    rng.shuffle(&mut same_action);
+    add_distinct(&mut chosen, &same_action, false);
+    if chosen.len() < OPTIONS {
+        let mut any: Vec<&Phrase> = pack.phrases().iter().collect();
+        rng.shuffle(&mut any);
+        add_distinct(&mut chosen, &any, true);
+    }
+    rng.shuffle(&mut chosen);
+    chosen
+}
+
+/// Adds candidates until there are four options, skipping any whose text is already an option's.
+fn add_distinct<'a>(chosen: &mut Vec<&'a Phrase>, candidates: &[&'a Phrase], skip_fragments: bool) {
+    for &candidate in candidates {
+        if chosen.len() == OPTIONS {
+            break;
+        }
+        if skip_fragments && candidate.is_fragment() {
+            continue;
+        }
+        if chosen.iter().all(|option| option.text != candidate.text) {
+            chosen.push(candidate);
+        }
+    }
+}
