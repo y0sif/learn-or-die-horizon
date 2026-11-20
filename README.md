@@ -20,11 +20,13 @@ The port has the core of Learn or Die with the German pack:
   with keys 1 to 4 or the mouse, or type it. The game pauses in single player while a question is open.
 - Right answers bring buffs or friendly mobs. Wrong ones bring debuffs, five monsters, lost hearts or death, as
   you choose, and always death in a Hardcore world. After several wrong answers in a row the angry teacher drops
-  your inventory. Rewards and penalties
-  work in single player, and for the host of a LAN world.
+  your inventory. Rewards and penalties work in single player, and for the host of a LAN world.
+- Every 20 minutes of play an exam asks up to 20 phrases you have met and shows your score.
+- The dictionary lists the phrases you know, word by word, with grammar notes and other forms, and plays them
+  normal or slow. Item tooltips show the German noun, and "what is this" names the block or mob you look at.
 - Your answers are saved per world. A phrase you know is not asked or said again in that world.
 
-Not ported yet: the exam, the dictionary, "what is this", item tooltips, the guide and voice answers.
+A short guide opens in your first world. Voice answers are not ported.
 
 ## Keys
 
@@ -34,11 +36,14 @@ Not ported yet: the exam, the dictionary, "what is this", item tooltips, the gui
 | M | Mute or unmute the teacher's voice |
 | K | Switch between normal and slow speech |
 | I | Open the settings |
+| J | Open the dictionary |
+| V | Say what you are looking at |
+| U | Open the guide |
 | 1 to 4 | Answer a question |
 | Enter | Check a typed answer |
 | Esc | Pause during a question; it comes back when you resume |
 
-N, M, K and I can be changed in Controls, Key Binds.
+These keys can be changed in Controls, Key Binds, except 1 to 4, Enter and Esc.
 
 ## Install
 
@@ -55,7 +60,8 @@ German pack, the voices and the portrait from that jar. It contains none of them
 ## Settings
 
 Press I in a world to change the settings: question type and frequency, penalties and rewards, the angry
-teacher, speech speed and volume, and which actions the teacher talks about. They are saved at once to
+teacher, the exam, speech speed and volume, tooltips, and which actions the teacher talks about. They are saved
+at once to
 `config/learnordie.json` in the instance folder, with the original's setting names and defaults.
 
 ## License
