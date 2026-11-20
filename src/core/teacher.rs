@@ -129,7 +129,8 @@ pub enum Looked<'a> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Typed {
     /// What was typed, without surrounding whitespace. Not EXACT: the chat says it back
-    /// ("you typed: X", with a spelling note for CLOSE, or that nothing was typed).
+    /// (`learnordie.quiz.typed`, `learnordie.quiz.typed_close` for CLOSE, or
+    /// `learnordie.quiz.typed_nothing`).
     pub text: String,
     pub verdict: Verdict,
 }
@@ -437,7 +438,7 @@ impl Teacher {
     }
 
     /// The exam page's Stop. False when no exam runs. Else the exam is dropped and `examAuto` is
-    /// off: save the config and say "The exam is stopped."
+    /// off: save the config and say `learnordie.exam.stopped`.
     pub fn stop_exam(&mut self) -> bool {
         if self.quiz.exam().is_off() {
             return false;
@@ -448,13 +449,13 @@ impl Teacher {
     }
 
     /// Where the exam stands: the exam page's Start or Stop button, and a question's header
-    /// ("Exam N/M") while it asks.
+    /// (`learnordie.exam.header`) while it asks.
     pub fn exam(&self, now: i64) -> ExamStage {
         self.quiz.exam().stage(now)
     }
 
-    /// The HUD's exam line, while the teacher is on: the countdown ("Exam in m:ss"), or between
-    /// the exam's questions the one that comes next ("Exam: question N of M").
+    /// The HUD's exam line, while the teacher is on: the countdown (`learnordie.exam.timer`), or
+    /// between the exam's questions the one that comes next (`learnordie.exam.timer_asking`).
     pub fn exam_hud(&self, now: i64) -> Option<ExamStage> {
         if !self.config.on() {
             return None;

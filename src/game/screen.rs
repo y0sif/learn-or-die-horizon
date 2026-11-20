@@ -5,7 +5,7 @@
 //!
 //! The choice question: the item's picture, the English prompt (or a replay button for a
 //! listening question), the timer bar and four German options as buttons; an exam's question has
-//! "Question N of M" at the card's top. Keys 1 to 4 and a click answer (both ignored for the
+//! `learnordie.exam.header` at the card's top. Keys 1 to 4 and a click answer (both ignored for the
 //! first 700 ms); Esc suspends the question and the pause menu opens (the `quiz_escape` mixin),
 //! and it comes back with the time left once no screen is open.
 //!

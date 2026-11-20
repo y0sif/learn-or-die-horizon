@@ -554,6 +554,36 @@ fn click_at(host: &FakeHost, [x, y, w, h]: [f32; 4]) -> bool {
     cancelled
 }
 
+/// A mouse event at the pointer's place.
+enum Mouse {
+    Press(i32),
+    /// The pointer moved there with the button held.
+    Drag(i32),
+    Release(i32),
+    /// The wheel, notches up (down when negative).
+    Wheel(f64),
+}
+
+/// The mouse event at `at`; whether the screen took it.
+fn mouse(host: &FakeHost, at: [f32; 2], event: Mouse) -> bool {
+    let (at, mut taken) = (screen_at(at), false);
+    match event {
+        Mouse::Press(b) => {
+            mod_api::dispatch_screen_mouse_button_pressed_pre(host, &at, b, 0, &mut taken);
+        }
+        Mouse::Drag(b) => {
+            mod_api::dispatch_screen_mouse_dragged_pre(host, &at, b, [0.0; 2], 0, &mut taken);
+        }
+        Mouse::Release(b) => {
+            mod_api::dispatch_screen_mouse_button_released_pre(host, &at, b, 0, &mut taken);
+        }
+        Mouse::Wheel(dy) => {
+            mod_api::dispatch_screen_mouse_scrolled_pre(host, &at, [0.0, dy], 0, &mut taken);
+        }
+    }
+    taken
+}
+
 /// What the typed question's box holds, as the teacher keeps it.
 fn kept_typed() -> String {
     with_state(|teacher, _| {
@@ -1278,7 +1308,21 @@ fn hooks_drive_the_teacher() {
         );
         tick(&mut host, &io, 50);
         assert!(quiz_pauses());
+        // In a low window the rows scroll by the wheel, a mark for more above or below; where
+        // they fit, the wheel is not taken.
+        let marks = |wheel: f64| {
+            assert!(mouse(&host, [240.0, 60.0], Mouse::Wheel(wheel)), "{wheel}");
+            let low = drawn(&host, [480.0, 100.0], [0.0, 0.0]);
+            (low.shows(" \u{25BC}"), low.shows("\u{25B2} "))
+        };
+        assert!(drawn(&host, [480.0, 100.0], [0.0, 0.0]).shows(" \u{25BC}"));
+        assert_eq!(marks(-10.0), (false, true), "scrolled to the end");
+        assert_eq!(marks(10.0), (true, false), "back at the top");
         let canvas = drawn(&host, SMALL, [0.0, 0.0]);
+        assert!(
+            !mouse(&host, [240.0, 60.0], Mouse::Wheel(-1.0)),
+            "the rows fit"
+        );
         canvas.all_on_screen();
         assert!(canvas.shows(&format!("learnordie.exam.result_title[{score}]")));
         let rows = |mark: &str| canvas.texts.iter().filter(|t| t.starts_with(mark)).count();
@@ -1338,6 +1382,69 @@ fn hooks_drive_the_teacher() {
         assert!(click_at(&host, canvas.button(&tabs.1)));
         let canvas = drawn(&host, WIDE, [0.0, 0.0]);
         assert!(canvas.inactive.contains(&tabs.1) && listed(&canvas, &all));
+        // Two rows of the four learned show in a low window. The arrow and Page keys move the
+        // selection, kept inside the list and in view; the wheel over the list, the scrollbar (a
+        // click, a drag), a drag along the rows and the middle button held scroll it. Listen
+        // tells the rows apart: it plays the selected one, and a click on the top row selects it.
+        const LOW: [f32; 2] = [960.0, 160.0];
+        assert_eq!(all.len(), 4, "{all:?}");
+        // The row Listen plays, and the top row in view.
+        let heard = |host: &FakeHost| {
+            let before: Vec<usize> = all.iter().map(|p| io.plays_at("normal", &p.id)).collect();
+            let canvas = drawn(host, LOW, [0.0, 0.0]);
+            let top = all.iter().position(|p| canvas.shows(p.bare()));
+            assert!(click_at(host, canvas.button("learnordie.dict.play")));
+            let after = all.iter().map(|p| io.plays_at("normal", &p.id));
+            let played = after.zip(before).position(|(n, b)| n > b);
+            (played.expect("a row"), top.expect("rows"))
+        };
+        let top = |host: &FakeHost| {
+            let canvas = drawn(host, LOW, [0.0, 0.0]);
+            let row = canvas.buttons.iter().find(|(label, _)| label.is_empty());
+            assert!(click_at(host, row.expect("a row").1));
+            mouse(host, [0.0, 0.0], Mouse::Release(0));
+            heard(host).0
+        };
+        drawn(&host, LOW, [0.0, 0.0]);
+        #[rustfmt::skip]
+        let keys = [("down", (1, 0)), ("down", (2, 1)), ("up", (1, 1)), ("page.down", (3, 2)),
+            ("down", (3, 2)), ("page.up", (1, 1)), ("up", (0, 0)), ("up", (0, 0))];
+        for (key, heard_and_top) in keys {
+            let key_name = format!("key.keyboard.{key}");
+            assert!(press(&host, &screen, &key_name), "{key}");
+            assert_eq!(heard(&host), heard_and_top, "{key}");
+        }
+        for (notches, scroll) in [(-1_i8, 1), (-2, 2), (1, 1)] {
+            for _ in 0..notches.abs() {
+                let notch = f64::from(notches.signum());
+                assert!(mouse(&host, [100.0, 100.0], Mouse::Wheel(notch)));
+            }
+            assert_eq!(top(&host), scroll, "{notches} notches");
+        }
+        assert!(
+            !mouse(&host, [600.0, 100.0], Mouse::Wheel(-1.0)),
+            "the pane's wheel"
+        );
+        // The scrollbar: a click at its bottom, then a drag from there to its top.
+        assert!(mouse(&host, [219.0, 120.0], Mouse::Press(0)));
+        mouse(&host, [219.0, 120.0], Mouse::Release(0));
+        assert_eq!(top(&host), 2, "a click on the scrollbar's bottom");
+        assert!(mouse(&host, [219.0, 120.0], Mouse::Press(0)));
+        assert!(mouse(&host, [219.0, 72.0], Mouse::Drag(0)));
+        mouse(&host, [219.0, 72.0], Mouse::Release(0));
+        assert_eq!(top(&host), 0, "the scrollbar dragged to its top");
+        // A drag two rows up along the list; then the middle button held 30 px above where it
+        // went down: a row a tick, until it is let go.
+        mouse(&host, [114.0, 110.0], Mouse::Press(0));
+        assert!(mouse(&host, [114.0, 58.0], Mouse::Drag(0)));
+        mouse(&host, [114.0, 58.0], Mouse::Release(0));
+        assert_eq!(top(&host), 2, "the rows dragged up");
+        assert!(mouse(&host, [100.0, 80.0], Mouse::Press(2)));
+        assert!(mouse(&host, [100.0, 50.0], Mouse::Drag(2)));
+        tick(&mut host, &io, 50);
+        mouse(&host, [100.0, 50.0], Mouse::Release(2));
+        tick(&mut host, &io, 50);
+        assert_eq!(top(&host), 1, "the middle button");
         let target = all
             .iter()
             .find(|p| !p.parts.is_empty())

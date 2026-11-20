@@ -112,7 +112,7 @@ fn lists(value: &Value) -> Result<Vec<Vec<String>>, String> {
 
 impl Dictionary {
     /// Parses `dictionary.json`. On an error the caller goes on with an empty dictionary, which
-    /// the screen shows as "no dictionary yet".
+    /// the screen shows as `learnordie.dict.no_data`.
     pub fn parse(text: &str) -> Result<Dictionary, String> {
         let root: Value =
             serde_json::from_str(text).map_err(|e| format!("dictionary.json: {e}"))?;

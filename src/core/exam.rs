@@ -12,7 +12,7 @@
 //! countdown, the rest of a tie in random order, one phrase per text, up to 20. An exam started by
 //! hand has no baseline: every hearing in this world counts.
 //!
-//! Asking: the first question 1 s after the questions begin, then one 2.5 s after each answer,
+//! Asking: the first question 1.5 s after the questions begin, then one 2.5 s after each answer,
 //! each by a kind picked at random among the enabled ones (buttons, typing; voice answers are not
 //! ported). Normal questions wait meanwhile; during the countdown they come as usual. An exam
 //! answer has consequences only with `examPenalties`, as it was when the exam started. The result
@@ -30,7 +30,7 @@ pub(crate) const QUESTIONS: usize = 20;
 /// Between an answer and the next question, and after the last answer before the result.
 pub(crate) const GAP_MS: i64 = 2500;
 /// The first question comes this long after the questions begin.
-pub(crate) const FIRST_AFTER_MS: i64 = 1000;
+pub(crate) const FIRST_AFTER_MS: i64 = 1500;
 
 /// Where the exam stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,15 +65,15 @@ impl ExamRow {
         en.strip_suffix(['.', '!']).unwrap_or(en)
     }
 
-    /// The note under a wrong row: the answer given ("your answer: X"), or `None` for "no
-    /// answer" when it is blank.
+    /// The note under a wrong row: the answer given (`learnordie.exam.your_answer`), or `None`
+    /// for `learnordie.exam.no_answer` when it is blank.
     pub fn answer(&self) -> Option<&str> {
         (!self.given.chars().all(java_whitespace)).then_some(self.given.as_str())
     }
 }
 
-/// A finished exam, for the chat line ("N of M right") and the result screen. Progress has it
-/// already.
+/// A finished exam, for the chat line (`learnordie.exam.result`) and the result screen
+/// (`learnordie.exam.result_title`). Progress has it already.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExamResult {
     /// The countdown's minutes; 0 for an exam started by hand.

@@ -88,8 +88,8 @@ pub(crate) fn draw(_host: &dyn ClientHost, event: &mut GuiLayerDrawEvent<'_>) {
 }
 
 /// The exam's line (`NarratorHud.examLine`), where the original draws its timer line with no
-/// counter: the top left, 6 px in, gold. "Exam in m:ss" while it counts down; between its
-/// questions, the one that comes next.
+/// counter: the top left, 6 px in, gold. `learnordie.exam.timer` while it counts down; between
+/// its questions, the one that comes next (`learnordie.exam.timer_asking`).
 fn exam_line(draw: &mut dyn DrawContext, teacher: &Teacher, now: i64) {
     let text = match teacher.exam_hud(now) {
         Some(ExamStage::Playing { left }) => {

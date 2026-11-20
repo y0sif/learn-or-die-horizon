@@ -222,8 +222,7 @@ pub fn settings(page: Page, pack: &Pack) -> Vec<Setting> {
 }
 
 /// The main page's link to the exam page: with `examAuto` on, the minutes as the original writes
-/// a number, for "Exam: every N min..." (`options.exam.on`); `None` for "Exam: off..."
-/// (`options.exam.off`).
+/// a number, for `learnordie.options.exam.on`; `None` for `learnordie.options.exam.off`.
 pub fn exam_link(config: &Config) -> Option<String> {
     config
         .exam_auto

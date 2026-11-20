@@ -46,11 +46,12 @@ pub enum QuizEvent {
     Resume,
     /// The question screen was replaced by another one: the question is dropped, no penalty.
     Dropped,
-    /// The exam's questions begin: say "Exam time! N questions." The first comes 1 s later.
+    /// The exam's questions begin: say `learnordie.exam.begin`. The first comes 1.5 s later.
     ExamBegins { questions: usize },
     /// The exam's time is up, but nothing came up to ask about: say so. The exam is off.
     ExamEmpty,
-    /// The exam is over: say "N of M right" and show the result screen, which pauses the game.
+    /// The exam is over: say `learnordie.exam.result` and show the result screen, which pauses
+    /// the game.
     /// Progress has the result already.
     ExamOver(ExamResult),
 }

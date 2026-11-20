@@ -113,6 +113,65 @@ struct Resolved {
     forms: Vec<(String, String, String)>,
 }
 
+/// A line of text and its width.
+type Line = (String, f32);
+
+/// The selected phrase's pane measured where it is drawn (`detail_pane`), kept while the phrase
+/// and the pane's edges stay the same: a frame measures and wraps nothing.
+#[derive(Debug)]
+struct Pane {
+    id: String,
+    /// The pane's left and right edges.
+    at: [f32; 2],
+    /// The translation's label, where the translation starts, and its lines.
+    label: String,
+    en_x: f32,
+    en: Vec<Line>,
+    /// Each word's width, its hint's and its reading's, unscaled.
+    words: Vec<[f32; 3]>,
+    grammar: String,
+    forms_heading: String,
+    notes: Vec<Vec<Line>>,
+    /// Each form's lines (wrapped for its larger size) and its label's.
+    forms: Vec<(Vec<Line>, Vec<Line>)>,
+}
+
+impl Pane {
+    fn new(
+        draw: &dyn DrawContext,
+        (host, io): (&dyn ClientHost, &dyn Client),
+        (phrase, detail): (&Phrase, &Resolved),
+        [dx, d_right]: [f32; 2],
+    ) -> Pane {
+        let say = |key: &str| io.tr(host, &Text::translate(key, vec![]));
+        let label = say("learnordie.dict.translation");
+        let en_x = dx + draw.text_width(&label) + 6.0;
+        let room = d_right - dx;
+        let words = detail.words.iter().map(|(part, hint)| {
+            let width = |text: &str| draw.text_width(text);
+            [width(&part.text), width(hint), width(&part.reading)]
+        });
+        let forms = detail.forms.iter().map(|(text, _, label)| {
+            (
+                lines(draw, text, room / FORM_SCALE),
+                lines(draw, label, room),
+            )
+        });
+        Pane {
+            id: detail.id.clone(),
+            at: [dx, d_right],
+            en: lines(draw, &phrase.en, d_right - en_x),
+            label,
+            en_x,
+            words: words.collect(),
+            grammar: say("learnordie.dict.grammar"),
+            forms_heading: say("learnordie.dict.forms"),
+            notes: detail.notes.iter().map(|n| lines(draw, n, room)).collect(),
+            forms: forms.collect(),
+        }
+    }
+}
+
 /// The dictionary showing.
 pub(crate) struct DictionaryScreen {
     all: Vec<String>,
@@ -135,7 +194,12 @@ pub(crate) struct DictionaryScreen {
     /// A drag along the rows: where it began and the scroll then.
     list_drag: Option<(f32, usize)>,
     auto: Option<Auto>,
+    /// Each listed phrase's German and translation as its row draws them (`fit`), once drawn;
+    /// kept while the list and the rows' width (`row_w`) stay the same.
+    row_text: Vec<Option<(String, String)>>,
+    row_w: f32,
     detail: Option<Resolved>,
+    pane: Option<Pane>,
     playing: Option<SoundRef>,
 }
 
@@ -159,19 +223,33 @@ fn slot(draw: &mut dyn DrawContext, [x, y]: [f32; 2], size: f32) {
     fill(draw, [x + size - 1.0, y, x + size, y + size], WHITE);
 }
 
-/// `fit`: the text cut to `width`, ending in an ellipsis when cut.
+/// `fit`: the text cut to `width`, ending in an ellipsis when cut. The longest start that fits
+/// is found by halving, as a longer start is never narrower.
 fn fit(draw: &dyn DrawContext, text: &str, width: f32) -> String {
     let chars: Vec<char> = text.chars().collect();
-    let mut len = chars.len();
-    while len > 0 && draw.text_width(&chars[..len].iter().collect::<String>()) > width {
-        len -= 1;
-    }
+    let start = |len: usize| chars[..len].iter().collect::<String>();
+    let fits = |len: usize| draw.text_width(&start(len)) <= width;
+    let len = if fits(chars.len()) {
+        chars.len()
+    } else {
+        // The start of `fitting` characters fits (or is empty), that of `over` does not.
+        let (mut fitting, mut over) = (0, chars.len());
+        while over - fitting > 1 {
+            let mid = (fitting + over) / 2;
+            if fits(mid) {
+                fitting = mid;
+            } else {
+                over = mid;
+            }
+        }
+        fitting
+    };
     if len < chars.len() && len > 1 {
-        let mut cut: String = chars[..len - 1].iter().collect();
+        let mut cut = start(len - 1);
         cut.push('\u{2026}');
         cut
     } else {
-        chars[..len].iter().collect()
+        start(len)
     }
 }
 
@@ -197,8 +275,44 @@ pub(crate) fn wrap(draw: &dyn DrawContext, text: &str, width: f32) -> Vec<String
     lines
 }
 
-/// `wrapped`: the text in lines 10 px apart from `y`, a word wider than the room drawn smaller;
+/// [`wrap`]'s lines, each with its width.
+fn lines(draw: &dyn DrawContext, text: &str, width: f32) -> Vec<Line> {
+    let measured = |line: String| {
+        let width = draw.text_width(&line);
+        (line, width)
+    };
+    wrap(draw, text, width).into_iter().map(measured).collect()
+}
+
+/// `wrapped`: the lines 10 px apart from `y`, one wider than the room (a word) drawn smaller;
 /// where the next line would go.
+fn draw_lines(
+    draw: &mut dyn DrawContext,
+    lines: &[Line],
+    [x, y]: [f32; 2],
+    right: f32,
+    colour: u32,
+) -> f32 {
+    let room = right - x;
+    let mut y = y;
+    for (line, width) in lines {
+        if *width > room {
+            scaled(
+                draw,
+                Text::literal(line.clone()),
+                [x, y],
+                room / width,
+                colour,
+            );
+        } else {
+            draw.text(line, [x, y], colour, true);
+        }
+        y += 10.0;
+    }
+    y
+}
+
+/// The text wrapped to the room and drawn as [`draw_lines`] draws it.
 fn wrapped(
     draw: &mut dyn DrawContext,
     text: &str,
@@ -206,18 +320,8 @@ fn wrapped(
     right: f32,
     colour: u32,
 ) -> f32 {
-    let room = right - x;
-    let mut y = y;
-    for line in wrap(draw, text, room) {
-        let width = draw.text_width(&line);
-        if width > room {
-            scaled(draw, Text::literal(line), [x, y], room / width, colour);
-        } else {
-            draw.text(&line, [x, y], colour, true);
-        }
-        y += 10.0;
-    }
-    y
+    let lines = lines(draw, text, right - x);
+    draw_lines(draw, &lines, [x, y], right, colour)
 }
 
 /// A hint, a note's argument or a form's label as the client's lang has it.
@@ -338,7 +442,10 @@ impl DictionaryScreen {
             dragging: false,
             list_drag: None,
             auto: None,
+            row_text: Vec::new(),
+            row_w: 0.0,
             detail: None,
+            pane: None,
             playing: None,
         };
         page.refilter(teacher);
@@ -365,6 +472,7 @@ impl DictionaryScreen {
             .into_iter()
             .map(|phrase| phrase.id.clone())
             .collect();
+        self.row_text.clear();
         self.selected = self.selected.min(self.shown.len().saturating_sub(1));
         self.update_rows();
     }
@@ -608,16 +716,36 @@ impl DictionaryScreen {
         }
     }
 
+    /// The rows in view have their German and translation cut to `max_w` (`row_text`), as
+    /// `fit` cuts them.
+    fn fit_rows(&mut self, draw: &dyn DrawContext, teacher: &Teacher, max_w: f32) {
+        if self.row_w != max_w || self.row_text.len() != self.shown.len() {
+            self.row_w = max_w;
+            self.row_text = vec![None; self.shown.len()];
+        }
+        let end = self.shown.len().min(self.scroll + self.layout.rows);
+        for i in self.scroll..end {
+            if self.row_text[i].is_none()
+                && let Some(phrase) = teacher.pack.phrase(&self.shown[i])
+            {
+                let en = fit(draw, bare(&phrase.en), max_w / 0.75);
+                self.row_text[i] = Some((fit(draw, phrase.bare(), max_w), en));
+            }
+        }
+    }
+
     /// `drawRows`: the middle button's anchor, the scrollbar, and each row's picture, German
     /// and translation over its button, the selected one marked.
     fn draw_rows(
-        &self,
+        &mut self,
         draw: &mut dyn DrawContext,
         host: &dyn ClientHost,
         teacher: &Teacher,
         pictures: &Pictures,
     ) {
         let l = self.layout;
+        let max_w = l.row(0)[2] - 32.0;
+        self.fit_rows(draw, teacher, max_w);
         if let Some(auto) = self.auto {
             let [ax, ay] = auto.anchor;
             fill(draw, [ax - 1.0, ay - 6.0, ax + 2.0, ay + 7.0], 0xC0FF_FFFF);
@@ -648,7 +776,7 @@ impl DictionaryScreen {
             else {
                 break;
             };
-            let [x, y, w, h] = l.row(i);
+            let [x, y, _, h] = l.row(i);
             if self.scroll + i == self.selected {
                 fill(draw, [x - 4.0, y, x - 1.0, y + h], GOLD);
             }
@@ -656,10 +784,12 @@ impl DictionaryScreen {
             if let Some(item) = picture(host, teacher, pictures, phrase) {
                 draw.item(item, [x + 5.0, y + (h - 16.0) / 2.0], 16.0);
             }
-            let (tx, max_w) = (x + 28.0, w - 32.0);
-            draw.text(&fit(draw, phrase.bare(), max_w), [tx, y + 3.0], WHITE, true);
-            let en = fit(draw, bare(&phrase.en), max_w / 0.75);
-            scaled(draw, Text::literal(en), [tx, y + 14.0], 0.75, GREY);
+            let Some((german, en)) = &self.row_text[self.scroll + i] else {
+                break;
+            };
+            let tx = x + 28.0;
+            draw.text(german, [tx, y + 3.0], WHITE, true);
+            scaled(draw, Text::literal(en.clone()), [tx, y + 14.0], 0.75, GREY);
         }
     }
 
@@ -672,7 +802,7 @@ impl DictionaryScreen {
         host: &dyn ClientHost,
         teacher: &Teacher,
         pictures: &Pictures,
-        (phrase, detail): (&Phrase, &Resolved),
+        (phrase, detail, pane): (&Phrase, &Resolved, &Pane),
         [dx, d_right]: [f32; 2],
     ) -> f32 {
         let top0 = self.layout.top + 10.0;
@@ -686,10 +816,10 @@ impl DictionaryScreen {
         let line_h = if readings { 42.0 } else { 32.0 };
         let room = (d_right - sx).max(1.0);
         let config = &teacher.config;
-        for (part, hint) in &detail.words {
-            let word_w = draw.text_width(&part.text) * 2.0;
-            let hint_w = draw.text_width(hint) * 0.7;
-            let reading_w = draw.text_width(&part.reading) * 0.9;
+        for ((part, hint), [word_w, hint_w, reading_w]) in detail.words.iter().zip(&pane.words) {
+            let word_w = word_w * 2.0;
+            let hint_w = hint_w * 0.7;
+            let reading_w = reading_w * 0.9;
             let col_w = word_w.max(hint_w).max(reading_w).ceil();
             let shrink = if col_w > room { room / col_w } else { 1.0 };
             let col_w = col_w * shrink;
@@ -735,7 +865,7 @@ impl DictionaryScreen {
     /// The right pane: the sentence, the translation, Play and Slow (kept inside the pane), the
     /// grammar notes and the other forms, as far as they fit. The translation and the forms wrap
     /// inside the pane, as the notes do (the original draws them on one line, past a narrow
-    /// window's edge).
+    /// window's edge). Their text is measured once for the phrase and the pane's edges (`pane`).
     #[allow(clippy::too_many_arguments)]
     fn detail_pane(
         &mut self,
@@ -749,27 +879,28 @@ impl DictionaryScreen {
     ) {
         let l = self.layout;
         let (dx, d_right) = (l.list_right + 16.0, l.right - 10.0);
-        let detail = self.detail.clone();
-        let after = match &detail {
-            Some(detail) => self.sentence(
+        if let Some(detail) = &self.detail
+            && self
+                .pane
+                .as_ref()
+                .is_none_or(|pane| pane.id != detail.id || pane.at != [dx, d_right])
+        {
+            let pane = Pane::new(draw, (host, io), (phrase, detail), [dx, d_right]);
+            self.pane = Some(pane);
+        }
+        let shown = self.detail.as_ref().zip(self.pane.as_ref());
+        let after = match shown {
+            Some((detail, pane)) => self.sentence(
                 draw,
                 host,
                 teacher,
                 pictures,
-                (phrase, detail),
+                (phrase, detail, pane),
                 [dx, d_right],
             ),
             None => l.top + 10.0,
         };
-        let label = io.tr(
-            host,
-            &Text::translate("learnordie.dict.translation", vec![]),
-        );
-        let en_x = dx + draw.text_width(&label) + 6.0;
-        let en_lines = match &detail {
-            Some(_) => wrap(draw, &phrase.en, d_right - en_x).len(),
-            None => 1,
-        };
+        let en_lines = shown.map_or(1, |(_, pane)| pane.en.len());
         let below = 14.0 + 10.0 * en_lines.saturating_sub(1) as f32;
         let buttons_y = (after + below).min(l.bottom - PLAY_H - 2.0);
         let play = [dx, buttons_y, PLAY_W, PLAY_H];
@@ -784,46 +915,42 @@ impl DictionaryScreen {
                 log_warn(format!("could not draw the dictionary's {key}: {e:?}"));
             }
         }
-        let Some(detail) = detail else {
+        let Some((detail, pane)) = shown else {
             return;
         };
-        draw.text(&label, [dx, after], GREY, true);
-        wrapped(draw, &phrase.en, [en_x, after], d_right, TEXT);
-        let heading = |key: &str| io.tr(host, &Text::translate(key, vec![]));
+        draw.text(&pane.label, [dx, after], GREY, true);
+        draw_lines(draw, &pane.en, [pane.en_x, after], d_right, TEXT);
         let mut y = buttons_y + 28.0;
-        draw.text(&heading("learnordie.dict.grammar"), [dx, y], GOLD, true);
+        draw.text(&pane.grammar, [dx, y], GOLD, true);
         y += 13.0;
-        for note in &detail.notes {
+        for note in &pane.notes {
             if y > l.bottom - 12.0 {
                 return;
             }
-            y = wrapped(draw, note, [dx, y], d_right, TEXT) + 3.0;
+            y = draw_lines(draw, note, [dx, y], d_right, TEXT) + 3.0;
         }
-        if detail.forms.is_empty() || y > l.bottom - 30.0 {
+        if pane.forms.is_empty() || y > l.bottom - 30.0 {
             return;
         }
         y += 5.0;
-        draw.text(&heading("learnordie.dict.forms"), [dx, y], GOLD, true);
+        draw.text(&pane.forms_heading, [dx, y], GOLD, true);
         y += 13.0;
         let room = d_right - dx;
-        for (text, reading, label) in &detail.forms {
-            let lines = wrap(draw, text, room / FORM_SCALE);
-            let labels = wrap(draw, label, room).len();
-            let extra = 14.0 * (lines.len() - 1) as f32 + 10.0 * (labels - 1) as f32;
+        for ((_, reading, _), (texts, labels)) in detail.forms.iter().zip(&pane.forms) {
+            let extra = 14.0 * (texts.len() - 1) as f32 + 10.0 * (labels.len() - 1) as f32;
             if y + extra > l.bottom - 22.0 {
                 return;
             }
-            for (i, line) in lines.iter().enumerate() {
-                let width = draw.text_width(line);
+            for (i, (line, width)) in texts.iter().enumerate() {
                 let s = FORM_SCALE.min(room / width.max(1.0));
                 scaled(draw, Text::literal(line.clone()), [dx, y], s, TEXT);
-                if i + 1 == lines.len() && !reading.is_empty() {
+                if i + 1 == texts.len() && !reading.is_empty() {
                     let at = [dx + (width * s).floor() + 8.0, y + 3.0];
                     draw.text(reading, at, READING, true);
                 }
                 y += 14.0;
             }
-            y = wrapped(draw, label, [dx, y], d_right, GREY) + 3.0;
+            y = draw_lines(draw, labels, [dx, y], d_right, GREY) + 3.0;
         }
     }
 }

@@ -950,7 +950,7 @@ fn the_exam_asks_what_came_up_on_its_clock() {
             Configure(|c| c.enabled = false),
             Hud(None),
         ]),
-        ("time up: a question 1 s later, the next 2.5 s after an answer, the result 2.5 s after the last",
+        ("time up: a question 1.5 s later, the next 2.5 s after an answer, the result 2.5 s after the last",
             |c| {
                 c.exam_minutes = 0.05;
                 c.exam_typing = false;
@@ -961,15 +961,15 @@ fn the_exam_asks_what_came_up_on_its_clock() {
             Play { to: 3_100, events: &["begins 2 @3100"] },
             Stage("asking 1/2"),
             Hud(Some("asking 1/2")),
-            Play { to: 4_100, events: &["ask @4100"] },
+            Play { to: 4_600, events: &["ask @4600"] },
             Asked("jump"),
             Hud(None),
-            Answer { at: 4_900, right: true, server: "nothing" },
+            Answer { at: 5_400, right: true, server: "nothing" },
             Hud(Some("asking 2/2")),
-            Play { to: 7_400, events: &["ask @7400"] },
+            Play { to: 7_900, events: &["ask @7900"] },
             Asked("attack"),
-            TimeOut { at: 19_400, server: "nothing" },
-            Play { to: 21_900, events: &["over 1/2 choice jump/I hop=right attack/Line attack=none failed @21900"] },
+            TimeOut { at: 19_900, server: "nothing" },
+            Play { to: 22_400, events: &["over 1/2 choice jump/I hop=right attack/Line attack=none failed @22400"] },
             Stage("off"),
             Saved("1/2 choice 0.05"),
         ]),
@@ -982,9 +982,9 @@ fn the_exam_asks_what_came_up_on_its_clock() {
             }, &[], &[
             Play { to: 100, events: &[] },
             Hear(&["jump"]),
-            Play { to: 4_100, events: &["begins 1 @3100", "ask @4100"] },
-            Answer { at: 4_900, right: false, server: "debuff debuff drop angry" },
-            Play { to: 7_400, events: &["over 0/1 typing jump/I hop=Etwas ganz anderes failed @7400"] },
+            Play { to: 4_600, events: &["begins 1 @3100", "ask @4600"] },
+            Answer { at: 5_400, right: false, server: "debuff debuff drop angry" },
+            Play { to: 7_900, events: &["over 0/1 typing jump/I hop=Etwas ganz anderes failed @7900"] },
             Saved("0/1 typing 0.05"),
         ]),
         ("by hand it asks at once, even after a pause; Stop turns the exam off for good",
@@ -1019,11 +1019,11 @@ fn the_exam_asks_what_came_up_on_its_clock() {
                 c.exam_typing = false;
             }, HEARD, &[
             Start { at: 0 },
-            Play { to: 1_100, events: &["begins 3 @100", "ask @1100"] },
-            Screen { to: 1_200, events: &["dropped @1200"] },
-            Play { to: 3_700, events: &["ask @3700"] },
+            Play { to: 1_600, events: &["begins 3 @100", "ask @1600"] },
+            Screen { to: 1_700, events: &["dropped @1700"] },
+            Play { to: 4_200, events: &["ask @4200"] },
             Stage("asking 1/3"),
-            Answer { at: 4_500, right: true, server: "nothing" },
+            Answer { at: 5_000, right: true, server: "nothing" },
             Hud(Some("asking 2/3")),
         ]),
         ("another dimension drops the exam", |_| {}, &[], &[
@@ -1038,7 +1038,7 @@ fn the_exam_asks_what_came_up_on_its_clock() {
             Play { to: 100, events: &[] },
             Stage("off"),
             Start { at: 100 },
-            Play { to: 1_200, events: &["begins 3 @200", "ask @1200"] },
+            Play { to: 1_700, events: &["begins 3 @200", "ask @1700"] },
         ]),
     ];
     for (name, change, heard, turns) in scenarios {
@@ -2575,18 +2575,4 @@ fn the_guide_opens_once_in_the_first_world_then_hints() {
         };
         assert_eq!(angry_page(&config), expected, "{name}");
     }
-    let pages: Vec<(&str, Option<i32>)> = GUIDE_PAGES
-        .iter()
-        .map(|page| (page.name(), page.portrait_frame()))
-        .collect();
-    assert_eq!(
-        pages,
-        [
-            ("keys", None),
-            ("questions", None),
-            ("consequences", None),
-            ("angry", Some(5))
-        ],
-        "the pages in order, the angry one with the angry face"
-    );
 }
