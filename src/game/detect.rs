@@ -184,5 +184,6 @@ pub(crate) fn world_tick<'a>(
         position: view.position,
         yaw: view.yaw,
         pitch: view.pitch,
+        ..WorldTick::default()
     }
 }

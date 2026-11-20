@@ -180,6 +180,12 @@ pub struct Meta {
     pub has_reading: bool,
     pub ui_correct: String,
     pub ui_wrong: String,
+    /// The languages whose hints the pack has, for the translation setting.
+    pub hint_languages: Vec<String>,
+    /// `countNoun: "hold"`: a counted sentence with no plural uses the held-item noun.
+    pub count_noun_is_hold: bool,
+    /// `countOrder: "head"`: a counted pickup or drop says the noun (`head.<key>`) first.
+    pub count_head_first: bool,
     /// The first portrait the pack lists.
     pub sprite: Sprite,
 }
@@ -221,6 +227,16 @@ impl Meta {
                 .is_some_and(|value| gson::as_bool(value).unwrap_or(false)),
             ui_correct: text(ui, "correct", "\u{2713}"),
             ui_wrong: text(ui, "wrong", "\u{2717}"),
+            hint_languages: field(meta, "hintLanguages")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|v| gson::as_string(v).ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            count_noun_is_hold: text(meta, "countNoun", "") == "hold",
+            count_head_first: text(meta, "countOrder", "") == "head",
             namespace: namespace.to_string(),
             language,
             sprite,
@@ -430,6 +446,50 @@ impl Pack {
         }
         self.for_block("open", block)
             .or_else(|| self.for_block("use", block))
+    }
+
+    /// The grammatical gender of a word key: the last word with the key decides, `ge` when it
+    /// gives none.
+    pub fn measure_of(&self, key: &str) -> &str {
+        self.words
+            .iter()
+            .rev()
+            .find(|word| word.key == key)
+            .map_or("ge", |word| word.measure.as_str())
+    }
+
+    /// The English plural of a word key for counted sentences (`countEn`), if the pack has one.
+    pub fn count_en(&self, key: &str) -> Option<&str> {
+        self.words
+            .iter()
+            .rev()
+            .filter(|word| word.key == key)
+            .find_map(|word| word.count_en.as_deref())
+    }
+
+    /// The start of a counted sentence, such as "I pick up fourteen": `count.<action>.<n>.<measure>`,
+    /// else `count.<action>.<n>`.
+    pub fn count_start(&self, action: &str, n: i32, measure: &str) -> Option<&Phrase> {
+        self.phrase(&format!("count.{action}.{n}.{measure}"))
+            .or_else(|| self.phrase(&format!("count.{action}.{n}")))
+    }
+
+    /// The counted noun: `plural.<key>.<action>`, else `plural.<key>`, else (with
+    /// `countNoun: "hold"`) `hold.<key>`.
+    pub fn count_noun(&self, action: &str, key: &str) -> Option<&Phrase> {
+        self.phrase(&format!("plural.{key}.{action}"))
+            .or_else(|| self.phrase(&format!("plural.{key}")))
+            .or_else(|| {
+                self.meta
+                    .count_noun_is_hold
+                    .then(|| self.phrase(&format!("hold.{key}")))
+                    .flatten()
+            })
+    }
+
+    /// The amount on its own, such as "fourteen pieces.": `count.<n>.<measure>`.
+    pub fn count_unit(&self, n: i32, measure: &str) -> Option<&Phrase> {
+        self.phrase(&format!("count.{n}.{measure}"))
     }
 
     /// The raw patterns of the last word with this kind and key.

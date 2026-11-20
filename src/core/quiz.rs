@@ -1,25 +1,35 @@
-//! The choice quiz (Java `QuizManager` and `QuizScreen`, the choice path): when a question is
-//! due, which phrase is asked, its four options, and the clock of the open question.
+//! The quiz (Java `QuizManager`, `QuizScreen` and `TypingScreen`): when a question is due, which
+//! phrase is asked, as a choice of four or to type, and the clock of the open question.
+//!
+//! Modes: `choice` asks with buttons, `typing` asks to type, `mixed` rolls one in three for
+//! typing. Voice answers are not ported, so `speech`, and the voice third of `mixed`, ask with
+//! buttons.
 //!
 //! Schedule: a question comes every `quizIntervalSeconds` of play. Time with a screen open, or a
 //! tick gap over a second, does not count. Nothing is asked before the teacher said something in
 //! this world, and the first question comes a full interval after that. The player must be calm;
 //! in singleplayer with `quizPauseGame` most reasons are waived, but never `afk`, `dead` or `busy`.
 //!
-//! Clock: answers are ignored for the first 700 ms; time-out counts as wrong. Esc suspends the
-//! question with the time left (at least 1 s); when no screen is open any more it comes back with
-//! that time and a new 700 ms lockout.
+//! Clock: a choice has `quizAnswerSeconds` and ignores answers for the first 700 ms; time-out
+//! counts as wrong. A typed question has `max(20, 2 x quizAnswerSeconds)` and ignores input for
+//! the first 400 ms; an empty submit does nothing, and time-out submits what was typed. Esc
+//! suspends the question with the time left (at least 1 s) and what was typed; when no screen is
+//! open any more it comes back with them and a new lockout.
 use super::config::Config;
 use super::pack::{Pack, Phrase};
 use super::progress::Progress;
 use super::rng::Rng;
 use super::teacher::WorldTick;
+use super::typed::{self, PackWords, Verdict, java_strip, java_whitespace};
 
 const CALM_AFTER_DAMAGE_MS: i64 = 5000;
 const AFK_AFTER_MS: i64 = 20_000;
 const BUSY_MS: i64 = 1500;
 const PICK_RETRY_MS: i64 = 1000;
 const ACCEPT_AFTER_MS: i64 = 700;
+const TYPED_ACCEPT_AFTER_MS: i64 = 400;
+const MIN_TYPING_SECONDS: f32 = 20.0;
+const ANGRY_MS: i64 = 8000;
 const MIN_SUSPENDED_MS: i64 = 1000;
 const FROWN_MS: i64 = 2500;
 const OPTIONS: usize = 4;
@@ -49,16 +59,30 @@ enum Clock {
 }
 
 impl Clock {
-    fn showing(now: i64, total_ms: i64) -> Clock {
+    fn showing(now: i64, total_ms: i64, kind: QuestionKind) -> Clock {
+        let lockout = match kind {
+            QuestionKind::Choice => ACCEPT_AFTER_MS,
+            QuestionKind::Typing => TYPED_ACCEPT_AFTER_MS,
+        };
         Clock::Showing {
             deadline: now + total_ms,
-            accept_after: now + ACCEPT_AFTER_MS,
+            accept_after: now + lockout,
             total_ms,
         }
     }
 }
 
-/// The question being asked, with its options in screen order (keys 1 to 4).
+/// How the question is answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuestionKind {
+    /// Four options, keys 1 to 4 or a click.
+    Choice,
+    /// An edit box and a Check button; Enter submits.
+    Typing,
+}
+
+/// The question being asked, with its options in screen order (keys 1 to 4); a typed question
+/// has none.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpenQuestion {
     pub question: Phrase,
@@ -66,6 +90,8 @@ pub struct OpenQuestion {
     /// The English prompt is hidden and the phrase is played instead: its `en` is blank or the
     /// same as its text.
     pub listening: bool,
+    pub kind: QuestionKind,
+    typed: String,
     clock: Clock,
 }
 
@@ -73,6 +99,16 @@ impl OpenQuestion {
     /// Suspended by Esc: the screen is closed until the question comes back.
     pub fn is_suspended(&self) -> bool {
         matches!(self.clock, Clock::Suspended { .. })
+    }
+
+    /// What the edit box holds: kept while the question is suspended, to fill the box again.
+    pub fn typed(&self) -> &str {
+        &self.typed
+    }
+
+    /// Past the lockout and showing: keys, characters and clicks count.
+    pub fn accepts_input(&self, now: i64) -> bool {
+        matches!(self.clock, Clock::Showing { accept_after, .. } if now >= accept_after)
     }
 
     /// Time left to answer, in ms.
@@ -98,6 +134,8 @@ impl OpenQuestion {
 pub(crate) struct Answer {
     pub(crate) question: Phrase,
     pub(crate) correct: bool,
+    /// A typed answer: what was typed (stripped) and its verdict.
+    pub(crate) typed: Option<(String, Verdict)>,
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +155,8 @@ pub(crate) struct Quiz {
     given: String,
     hop_at: i64,
     frown_until: i64,
+    wrong_streak: i32,
+    angry_until: i64,
 }
 
 impl Quiz {
@@ -141,6 +181,28 @@ impl Quiz {
     /// The teacher frowns for 2.5 s after a wrong answer.
     pub(crate) fn frowning(&self, now: i64) -> bool {
         now < self.frown_until
+    }
+
+    /// The angry face shows for 8 s after the angry teacher struck.
+    pub(crate) fn angry(&self, now: i64) -> bool {
+        now < self.angry_until
+    }
+
+    /// Counts an answer that had consequences toward the angry teacher: `angryAfterWrong` wrong
+    /// answers in a row, unless `angryTeacher` is `off`. A right one starts the count again.
+    /// True when he gets angry now.
+    pub(crate) fn angry_after(&mut self, correct: bool, config: &Config, now: i64) -> bool {
+        if correct {
+            self.wrong_streak = 0;
+            return false;
+        }
+        self.wrong_streak += 1;
+        if config.angry_teacher != "off" && self.wrong_streak >= config.angry_after_wrong.max(1) {
+            self.wrong_streak = 0;
+            self.angry_until = now + ANGRY_MS;
+            return true;
+        }
+        false
     }
 
     /// One client tick in a world, not paused.
@@ -188,7 +250,7 @@ impl Quiz {
                     return None;
                 }
                 if let Some(open) = &mut self.open {
-                    open.clock = Clock::showing(now, remaining_ms);
+                    open.clock = Clock::showing(now, remaining_ms, open.kind);
                 }
                 return Some(QuizEvent::Resume);
             }
@@ -228,23 +290,36 @@ impl Quiz {
                 return None;
             }
         }
+        let typing = match config.quiz_mode.as_str() {
+            "typing" => true,
+            "mixed" => rng.below(3) == 1,
+            _ => false,
+        };
         let Some(question) = pick(pack, config, progress, now, rng) else {
             self.nothing_to_ask = true;
             self.last_pick_try_at = now;
             return None;
         };
-        let options: Vec<Phrase> = choose_options(pack, &question, rng)
-            .into_iter()
-            .cloned()
-            .collect();
+        let (kind, options, seconds) = if typing {
+            let seconds = MIN_TYPING_SECONDS.max(config.quiz_answer_seconds * 2.0);
+            (QuestionKind::Typing, Vec::new(), seconds)
+        } else {
+            let options: Vec<Phrase> = choose_options(pack, &question, rng)
+                .into_iter()
+                .cloned()
+                .collect();
+            (QuestionKind::Choice, options, config.quiz_answer_seconds)
+        };
         self.given.clear();
         self.last_quiz_at = now;
-        let total_ms = (config.quiz_answer_seconds * 1000.0) as i64;
+        let total_ms = (seconds * 1000.0) as i64;
         self.open = Some(OpenQuestion {
             listening: question.en.trim().is_empty() || question.en == question.text,
             question,
             options,
-            clock: Clock::showing(now, total_ms),
+            kind,
+            typed: String::new(),
+            clock: Clock::showing(now, total_ms, kind),
         });
         Some(QuizEvent::Ask)
     }
@@ -291,15 +366,60 @@ impl Quiz {
         let option = open.options.get(index)?;
         let correct = option.id == open.question.id;
         self.given = option.bare().to_string();
-        self.finish(correct, now)
+        self.finish(correct, None, now)
     }
 
-    /// The screen's tick: time-out answers wrong.
-    pub(crate) fn screen_tick(&mut self, now: i64) -> Option<Answer> {
-        let clock = self.open.as_ref()?.clock;
-        match clock {
-            Clock::Showing { deadline, .. } if now >= deadline => self.finish(false, now),
-            _ => None,
+    /// The edit box changed: what it holds is kept for a time-out and for Esc.
+    pub(crate) fn set_typed(&mut self, typed: &str) {
+        if let Some(open) = &mut self.open
+            && open.kind == QuestionKind::Typing
+        {
+            open.typed = typed.to_string();
+        }
+    }
+
+    /// Enter or the Check button on a typed question. Ignored in the lockout, while suspended and
+    /// with an empty box.
+    pub(crate) fn submit_typed(
+        &mut self,
+        typed: &str,
+        now: i64,
+        words: &PackWords,
+    ) -> Option<Answer> {
+        let open = self.open.as_ref()?;
+        if open.kind != QuestionKind::Typing
+            || !open.accepts_input(now)
+            || typed.chars().all(java_whitespace)
+        {
+            return None;
+        }
+        self.judge_typed(typed, now, words)
+    }
+
+    fn judge_typed(&mut self, typed: &str, now: i64, words: &PackWords) -> Option<Answer> {
+        let text = &self.open.as_ref()?.question.text;
+        let verdict = typed::judge(typed, text, words);
+        let given = java_strip(typed).to_string();
+        self.given = given.clone();
+        self.finish(verdict.is_right(), Some((given, verdict)), now)
+    }
+
+    /// The screen's tick: a choice answers wrong at its time-out, a typed question submits what
+    /// was typed. `words` judges a typed answer.
+    pub(crate) fn screen_tick(&mut self, now: i64, words: &PackWords) -> Option<Answer> {
+        let open = self.open.as_ref()?;
+        let Clock::Showing { deadline, .. } = open.clock else {
+            return None;
+        };
+        if now < deadline {
+            return None;
+        }
+        match open.kind {
+            QuestionKind::Choice => self.finish(false, None, now),
+            QuestionKind::Typing => {
+                let typed = open.typed.clone();
+                self.judge_typed(&typed, now, words)
+            }
         }
     }
 
@@ -317,7 +437,12 @@ impl Quiz {
         true
     }
 
-    fn finish(&mut self, correct: bool, now: i64) -> Option<Answer> {
+    fn finish(
+        &mut self,
+        correct: bool,
+        typed: Option<(String, Verdict)>,
+        now: i64,
+    ) -> Option<Answer> {
         let open = self.open.take()?;
         self.last_quiz_at = now;
         self.last_tick_at = now;
@@ -333,6 +458,7 @@ impl Quiz {
         Some(Answer {
             question: open.question,
             correct,
+            typed,
         })
     }
 }

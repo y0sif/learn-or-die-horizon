@@ -3,7 +3,8 @@
 //! `{"worlds": {"<key>": {"heard", "quiz", "correctAt", "heartsLost", "deaths", "exams"}},
 //! "correctTotal", "lastCorrectAt", "deaths"}`, with `quiz` values as `[asked, correct]`.
 //!
-//! Invariants: every count is per world except `correctTotal`, `lastCorrectAt` and `deaths`.
+//! Invariants: every count is per world except `correctTotal`, `lastCorrectAt` and `deaths`
+//! (hardcore deaths). `heartsLost` comes back to 0 on a death.
 //! When a question was last asked is kept only in memory, as in the original, so it resets on load.
 //! Until [`Progress::switch_world`] names a world, counts go to a detached world that is never
 //! saved.
@@ -253,6 +254,45 @@ impl Progress {
             config.quiz_repeat_after_minutes
         };
         ((minutes * 60_000.0) as i64 - (now - at)).max(0)
+    }
+
+    /// Hearts the `hearts` penalty took in this world.
+    pub fn hearts_lost(&self) -> i32 {
+        self.world().hearts_lost
+    }
+
+    /// One more heart lost in this world; returns how many are lost now.
+    pub(crate) fn lose_heart(&mut self) -> i32 {
+        let world = self.world_mut();
+        world.hearts_lost += 1;
+        let lost = world.hearts_lost;
+        self.dirty = true;
+        lost
+    }
+
+    /// The player died: one more death in this world (and across worlds in a hardcore world),
+    /// the lost hearts come back, and in the `until_death` mode this world's right answers are
+    /// forgotten. Asks for a save.
+    pub fn record_death(&mut self, hardcore: bool, config: &Config) {
+        if hardcore {
+            self.deaths += 1;
+        }
+        let forget = config.learned_mode == "until_death";
+        let world = self.world_mut();
+        world.deaths += 1;
+        world.hearts_lost = 0;
+        let mut asked: Vec<String> = Vec::new();
+        if forget {
+            for (id, stats) in &mut world.quiz {
+                stats[1] = 0;
+                asked.push(id.clone());
+            }
+            world.correct_at.clear();
+        }
+        for id in asked {
+            self.last_correct_at.remove(&id);
+        }
+        self.save_now = true;
     }
 
     /// Time since the phrase was last asked; [`REST_FOREVER_MS`] when not asked since load.

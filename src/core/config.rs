@@ -1,4 +1,4 @@
-//! The teacher's settings (Java `NarratorConfig`), the subset the pilot reads, under the original
+//! The teacher's settings (Java `NarratorConfig`), the subset the port reads, under the original
 //! Gson field names and defaults. A key missing from the file keeps its default. Keys this port
 //! does not read are kept and written back unchanged, so no setting is lost between versions.
 use super::gson::{self, JsonObject};
@@ -83,6 +83,7 @@ config_fields! {
     float same_again_seconds "sameAgainSeconds" = 10.0;
     float series_pause_seconds "seriesPauseSeconds" = 2.0;
     float movement_delay_seconds "movementDelaySeconds" = 1.5;
+    float jump_cooldown_seconds "jumpCooldownSeconds" = 4.0;
     float same_event_cooldown_seconds "sameEventCooldownSeconds" = 0.6;
     int max_queue "maxQueue" = 2;
     bool say_movement "sayMovement" = false;
@@ -91,6 +92,12 @@ config_fields! {
     bool say_items "sayItems" = true;
     bool say_world "sayWorld" = true;
     bool say_held_item "sayHeldItem" = true;
+    bool say_weather_and_time "sayWeatherAndTime" = true;
+    bool say_climate "sayClimate" = true;
+    float climate_repeat_seconds "climateRepeatSeconds" = 0.0;
+    bool say_kills "sayKills" = true;
+    float weather_report_minutes "weatherReportMinutes" = 0.0;
+    bool say_damage "sayDamage" = true;
     string quiz_mode "quizMode" = "choice";
     string hint_language "hintLanguage" = "auto";
     float quiz_repeat_after_minutes "quizRepeatAfterMinutes" = 5.0;
@@ -102,7 +109,11 @@ config_fields! {
     float quiz_retry_after_seconds "quizRetryAfterSeconds" = 120.0;
     float quiz_interval_seconds "quizIntervalSeconds" = 60.0;
     float quiz_answer_seconds "quizAnswerSeconds" = 12.0;
+    string quiz_penalty "quizPenalty" = "debuff";
+    bool quiz_reward "quizReward" = true;
     bool quiz_pause_game "quizPauseGame" = true;
+    int angry_after_wrong "angryAfterWrong" = 5;
+    string angry_teacher "angryTeacher" = "drop";
     bool hud_enabled "hudEnabled" = true;
     string hud_font "hudFont" = "default";
     float hud_scale "hudScale" = 2.0;

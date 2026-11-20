@@ -1,8 +1,9 @@
 //! HUD decisions with no drawing (Java `NarratorHud`): the coloured pieces of a phrase, the
 //! teacher portrait's frame and hop, and the fades of the text and the held-item label.
 //!
-//! Portrait frames: 0 idle, 1 and 2 mouth open, 3 blink, 4 frown, 8 happy (from 9 frames on).
-//! The angry and shooting frames belong to the consequences, which come later.
+//! Portrait frames: 0 idle, 1 and 2 mouth open, 3 blink, 4 frown, 5 to 7 angry (7 talking, 6
+//! blinking), 8 happy (from 9 frames on). The German sheet has no shooting frames, so the hardcore
+//! kill comes at once and no shooting frame is ported.
 use super::config::Config;
 use super::pack::{Phrase, Sprite};
 
@@ -73,7 +74,9 @@ pub(crate) struct Portrait {
 
 impl Portrait {
     /// The frame to draw now. `mouth` is the speaker's mouth level, `hop_at` the last right
-    /// answer, `frowning` the 2.5 s after a wrong one.
+    /// answer, `angry` the 8 s after the angry teacher struck, `frowning` the 2.5 s after a wrong
+    /// answer.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn frame(
         &mut self,
         now: i64,
@@ -81,6 +84,7 @@ impl Portrait {
         mouth: i32,
         speaking: bool,
         hop_at: i64,
+        angry: bool,
         frowning: bool,
     ) -> i32 {
         let mut blink = false;
@@ -90,7 +94,15 @@ impl Portrait {
             blink = true;
         }
         let frames = sprite.frames;
-        if frames > 8 && now - hop_at < HAPPY_MS {
+        if angry {
+            if mouth > 0 && frames > 7 {
+                7
+            } else if blink {
+                6
+            } else {
+                5
+            }
+        } else if frames > 8 && now - hop_at < HAPPY_MS {
             if mouth > 0 && frames > 8 + mouth {
                 8 + mouth
             } else {

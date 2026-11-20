@@ -6,6 +6,11 @@
 //! Only a clip with no track ends when the game reports its sound stopped. One phrase plays at a
 //! time, 250 ms apart, and none longer than 9 s. A chain of clips plays one after the other: the
 //! next starts when the lipsync shows the previous clip's speech is over.
+//!
+//! A joined counted sentence (the count, then the plural) is one sound in the original, its PCM
+//! joined and its lipsync the first track padded to the first clip's length, then the second.
+//! Here the two clips play in turn, the second exactly where the first clip's track ends, so the
+//! mouth follows that same joined track; it counts as heard once, under the sentence's id.
 use super::config::Config;
 use super::pack::{Pack, Phrase};
 use super::progress::Progress;
@@ -40,6 +45,7 @@ struct Queued {
     priority: bool,
     sounds: Vec<Phrase>,
     voiced: bool,
+    joined: bool,
 }
 
 impl Queued {
@@ -50,6 +56,7 @@ impl Queued {
             priority,
             sounds: vec![phrase.clone()],
             voiced,
+            joined: false,
         }
     }
 }
@@ -59,6 +66,11 @@ struct Playing {
     clip_key: String,
     clip_started_at: i64,
     length_ms: Option<i64>,
+    /// The first clip of a joined sentence: the next starts when this one's track ends.
+    joined: bool,
+    /// The second clip of a joined sentence: the first clip's name and start, whose track the
+    /// mouth reads until this clip's own track starts.
+    after: Option<(String, i64)>,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +79,8 @@ pub(crate) struct Speaker {
     pending_sounds: VecDeque<Phrase>,
     last_said: HashMap<String, i64>,
     playing: Option<Playing>,
+    /// The phrase playing is a joined sentence: its clips are neither heard nor timed one by one.
+    joined: bool,
     silent: bool,
     shown: Option<Phrase>,
     started_at: i64,
@@ -147,8 +161,39 @@ impl Speaker {
             priority: false,
             sounds: sounds.to_vec(),
             voiced: false,
+            joined: false,
         });
         self.last_said.insert(last.id.clone(), now);
+    }
+
+    /// Shows `display` while `start` and `noun` play as one joined clip. The cooldown and the
+    /// queue go by the sentence's id; learned phrases are not checked, as in the original.
+    pub(crate) fn say_joined(
+        &mut self,
+        display: &Phrase,
+        start: &Phrase,
+        noun: &Phrase,
+        fresh: bool,
+        config: &Config,
+        now: i64,
+    ) {
+        if !config.on()
+            || !config.allows(&display.action)
+            || self.cooling(&display.id, fresh, config, now)
+            || self.is_queued(&display.id)
+            || !self.make_room(config)
+        {
+            return;
+        }
+        self.queue.push_back(Queued {
+            phrase: display.clone(),
+            repeat: false,
+            priority: false,
+            sounds: vec![start.clone(), noun.clone()],
+            voiced: false,
+            joined: true,
+        });
+        self.last_said.insert(display.id.clone(), now);
     }
 
     pub(crate) fn stop(&mut self, now: i64) {
@@ -224,9 +269,14 @@ impl Speaker {
         let mut over = false;
         if let Some(playing) = &self.playing {
             if !self.pending_sounds.is_empty() {
-                let spoken = pack.lipsync.spoken_ms(&playing.clip_key);
-                chain_next = spoken >= 0
-                    && now - playing.clip_started_at >= LIPSYNC_DELAY_MS + spoken + JOIN_MS;
+                let elapsed = now - playing.clip_started_at;
+                chain_next = match playing.length_ms {
+                    Some(length) if playing.joined => elapsed >= length,
+                    _ => {
+                        let spoken = pack.lipsync.spoken_ms(&playing.clip_key);
+                        spoken >= 0 && elapsed >= LIPSYNC_DELAY_MS + spoken + JOIN_MS
+                    }
+                };
             }
             let clip_done = match playing.length_ms {
                 Some(length) => now - playing.clip_started_at >= LIPSYNC_DELAY_MS + length,
@@ -263,6 +313,23 @@ impl Speaker {
         };
         self.started_at = now;
         self.silent = config.muted && !queued.voiced;
+        self.joined = false;
+        if queued.joined {
+            progress.heard(&queued.phrase.id);
+            // The original falls back to two clips in a row when the first has no sound.
+            let first = &queued.sounds[0];
+            let event = pack.sound_event(
+                &first.id,
+                pack.voice(&config.voice),
+                pack.speed(&config.speed),
+            );
+            if pack.has_sound(&event) {
+                self.joined = true;
+                for clip in &queued.sounds {
+                    self.last_said.insert(clip.id.clone(), now);
+                }
+            }
+        }
         self.shown = Some(queued.phrase);
         self.pending_sounds.extend(queued.sounds);
         if let Some(first) = self.pending_sounds.pop_front() {
@@ -278,6 +345,11 @@ impl Speaker {
         config: &Config,
         progress: &mut Progress,
     ) {
+        let after = self
+            .playing
+            .as_ref()
+            .filter(|before| before.joined)
+            .map(|before| (before.clip_key.clone(), before.clip_started_at));
         let voice = pack.voice(&config.voice);
         let speed = pack.speed(&config.speed);
         let event = pack.sound_event(&clip.id, voice, speed);
@@ -294,15 +366,37 @@ impl Speaker {
                 clip_key,
                 clip_started_at: now,
                 length_ms,
+                joined: self.joined && !self.pending_sounds.is_empty(),
+                after,
             });
             self.finished_at = 0;
         } else {
             self.finished_at = now;
         }
+        if self.joined {
+            return;
+        }
         self.last_said.insert(clip.id.clone(), now);
         if clip.key.is_some() || !clip.action.ends_with("count") {
             progress.heard(&clip.id);
         }
+    }
+
+    /// Drains the queue, naming each phrase, with its clips when it has more than one: joined
+    /// with `+`, in a row with `,`.
+    #[cfg(test)]
+    pub(crate) fn take_queued(&mut self) -> Vec<String> {
+        self.queue
+            .drain(..)
+            .map(|q| {
+                if q.sounds.len() < 2 {
+                    return q.phrase.id;
+                }
+                let clips: Vec<&str> = q.sounds.iter().map(|clip| clip.id.as_str()).collect();
+                let glue = if q.joined { "+" } else { "," };
+                format!("{}[{}]", q.phrase.id, clips.join(glue))
+            })
+            .collect()
     }
 
     /// The commands since the last call, in order.
@@ -320,10 +414,13 @@ impl Speaker {
     pub(crate) fn mouth(&self, now: i64, pack: &Pack) -> i32 {
         match &self.playing {
             Some(playing) if !self.silent => {
-                let level = pack.lipsync.mouth(
-                    &playing.clip_key,
-                    now - playing.clip_started_at - LIPSYNC_DELAY_MS,
-                );
+                let into = now - playing.clip_started_at - LIPSYNC_DELAY_MS;
+                let level = match &playing.after {
+                    Some((before, started_at)) if into < 0 => pack
+                        .lipsync
+                        .mouth(before, now - started_at - LIPSYNC_DELAY_MS),
+                    _ => pack.lipsync.mouth(&playing.clip_key, into),
+                };
                 if level >= 0 {
                     level
                 } else if (now / 120) % 2 == 0 {

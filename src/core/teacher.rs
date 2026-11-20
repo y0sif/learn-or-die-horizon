@@ -3,18 +3,21 @@
 //! to play, show and ask.
 //!
 //! Per client tick, in this order: [`Teacher::world_tick`] (in a world and not paused only), then
-//! [`Teacher::speaker_tick`] (always). Events between ticks: [`Teacher::block_broken`] and
-//! [`Teacher::block_placed`]. Call [`Teacher::joined_level`] whenever the level object changes,
+//! [`Teacher::speaker_tick`] (always). Events between ticks: [`Teacher::block_broken`],
+//! [`Teacher::block_placed`], [`Teacher::block_used`], [`Teacher::entity_attacked`] and
+//! [`Teacher::entity_used`]. Call [`Teacher::joined_level`] whenever the level object changes,
 //! before the first world tick in it. A new pack means a new `Teacher`, as a language switch
 //! rebuilds everything in the original.
 use super::config::Config;
+use super::consequences::{self, ServerAction, Wipe};
 use super::detector::{Detector, Speech};
 use super::hud::{self, HudText, Portrait, Span};
-use super::pack::{Pack, Phrase};
+use super::pack::{Pack, Phrase, path_of};
 use super::progress::Progress;
-use super::quiz::{Answer, OpenQuestion, Quiz, QuizEvent};
+use super::quiz::{Answer, OpenQuestion, QuestionKind, Quiz, QuizEvent};
 use super::rng::Rng;
 use super::speaker::{SoundCommand, Speaker};
+use super::typed::{PackWords, Verdict};
 
 /// What the game reports each tick while the player is in a world.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -41,16 +44,83 @@ pub struct WorldTick<'a> {
     pub question_screen_open: bool,
     /// An integrated server that is not open to LAN.
     pub singleplayer: bool,
+    /// Any integrated server, open to LAN or not (`getSingleplayerServer() != null`): answers
+    /// have consequences only then.
+    pub integrated_server: bool,
+    /// The world is a Hardcore world: the penalty is always `hardcore`.
+    pub hardcore: bool,
     pub dead: bool,
     pub health: f32,
+    /// The food level, 0 to 20.
+    pub food: i32,
     pub sleeping: bool,
     pub in_vehicle: bool,
+    /// The vehicle's entity id, for `ride.<entity>`; a sheep is `<colour>_sheep`.
+    pub vehicle: Option<&'a str>,
     pub in_water: bool,
     pub on_ground: bool,
     pub fall_flying: bool,
+    /// Creative flight (`getAbilities().flying`).
+    pub flying: bool,
+    /// `onClimbable()`.
+    pub on_climbable: bool,
+    /// `isSprinting()`.
+    pub sprinting: bool,
+    /// `isShiftKeyDown()`.
+    pub sneaking: bool,
+    /// `isOnFire() || isInLava()`.
+    pub on_fire: bool,
+    /// A fishing hook is out.
+    pub fishing: bool,
+    /// The item being used, when it is food or a consumable (`isUsingItem()` and the use item
+    /// has the FOOD or CONSUMABLE component).
+    pub eating: Option<&'a str>,
+    /// A movement key (forward, back, left, right) is down.
+    pub move_keys: bool,
+    /// The jump key is down.
+    pub jump_key: bool,
+    /// The drop key is down.
+    pub drop_key: bool,
+    /// `getDeltaMovement()`, blocks per tick.
+    pub velocity: [f64; 3],
     pub position: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    /// `level.isDarkOutside()`.
+    pub dark: bool,
+    /// `level.isRaining()` and `level.isThundering()`.
+    pub raining: bool,
+    pub thundering: bool,
+    /// The biome at the player has precipitation.
+    pub biome_rains: bool,
+    /// The biome is cold enough to snow at the player (`coldEnoughToSnow(pos, seaLevel)`).
+    pub biome_snows: bool,
+    /// The biome's base temperature.
+    pub biome_temperature: f32,
+    /// Living entities, not the player, hurt this very tick (`hurtTime == hurtDuration > 0`)
+    /// within 3 blocks of one of the player's projectiles: `(entity, entity id)`. Only needed
+    /// while `sayKills` is on.
+    pub projectile_hits: &'a [(u64, &'a str)],
+    /// Of [`Teacher::watched_entities`], those dying now or gone. One not listed is alive.
+    pub entity_fates: &'a [(u64, Fate)],
+}
+
+/// What became of an entity the teacher watches for a kill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fate {
+    /// `isDeadOrDying()`.
+    Dying,
+    /// `isRemoved()`, or no longer in the level.
+    Removed,
+}
+
+/// A typed answer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Typed {
+    /// What was typed, without surrounding whitespace. Not EXACT: the chat says it back
+    /// ("you typed: X", with a spelling note for CLOSE, or that nothing was typed).
+    pub text: String,
+    pub verdict: Verdict,
 }
 
 /// A finished question.
@@ -60,6 +130,15 @@ pub struct Outcome {
     pub correct: bool,
     /// This answer made the phrase learned; a `hold` phrase is a word, any other a phrase.
     pub learned: bool,
+    /// A typed question: what was typed and how close it was.
+    pub typed: Option<Typed>,
+    /// What the integrated server applies, in order. `None` with no integrated server: nothing
+    /// happens, and the original logs "Quiz rewards and penalties only work in singleplayer for
+    /// now".
+    pub server: Option<Vec<ServerAction>>,
+    /// The teacher got angry at this answer: his face for 8 s and his angry line, queued after
+    /// the question's sentence. The wipe itself is in `server`, when there is a server.
+    pub angry: Option<Wipe>,
 }
 
 pub struct Teacher {
@@ -74,6 +153,10 @@ pub struct Teacher {
     held_label: Option<(Phrase, i64)>,
     last_dimension: Option<String>,
     last_world_key: Option<String>,
+    /// Built on the first typed answer.
+    typed_words: Option<PackWords>,
+    integrated_server: bool,
+    hardcore: bool,
 }
 
 impl Teacher {
@@ -90,17 +173,33 @@ impl Teacher {
             held_label: None,
             last_dimension: None,
             last_world_key: None,
+            typed_words: None,
+            integrated_server: false,
+            hardcore: false,
         }
     }
 
-    /// The level object changed: a world was joined, or the dimension changed. Resets the
-    /// trackers, switches the progress world when the key changed, and restarts the quiz interval
-    /// in a new world or dimension.
+    /// The level object changed: a world was joined, or the dimension changed. Says the new
+    /// dimension when it differs from the last level's, resets the trackers, switches the
+    /// progress world when the key changed, and restarts the quiz interval in a new world or
+    /// dimension.
     pub fn joined_level(&mut self, now: i64, world_key: &str, dimension: &str, held_item: &str) {
         let new_key = self.last_world_key.as_deref() != Some(world_key);
         let new_world = new_key || self.last_dimension.as_deref() != Some(dimension);
+        if let Some(last) = &self.last_dimension
+            && path_of(last) != path_of(dimension)
+        {
+            let id = match path_of(dimension) {
+                "the_nether" => "dim_nether",
+                "the_end" => "dim_end",
+                _ => "dim_overworld",
+            };
+            if let Some(phrase) = self.pack.phrase(id) {
+                self.speaker.say_now(phrase, false, &self.config, now);
+            }
+        }
         self.last_dimension = Some(dimension.to_string());
-        self.detector.reset(held_item);
+        self.detector.reset(held_item, now);
         if new_key {
             self.last_world_key = Some(world_key.to_string());
             self.progress.switch_world(world_key);
@@ -128,8 +227,53 @@ impl Teacher {
         self.apply(speech, now);
     }
 
+    /// A main-hand right click on a block, not sneaking: says its close, open or use phrase.
+    /// False when it has none, and the click may place a block.
+    pub fn block_used(&mut self, now: i64, block: &str, is_open: bool) -> bool {
+        let Some(speech) = self
+            .detector
+            .block_used(block, is_open, now, &self.pack, &self.config)
+        else {
+            return false;
+        };
+        self.apply(speech, now);
+        true
+    }
+
+    /// The player attacked entity `id` (`entity` is its type id; a sheep is `<colour>_sheep`).
+    /// `living`: a living entity, then watched 6 s for the kill; `dying`: it is dying already,
+    /// and nothing is said.
+    pub fn entity_attacked(&mut self, now: i64, id: u64, entity: &str, living: bool, dying: bool) {
+        let speech = self
+            .detector
+            .entity_attacked(id, entity, living, dying, now, &self.pack);
+        self.apply(speech, now);
+    }
+
+    /// A main-hand right click on an entity, holding `held_item`; `held_is_food` when it has the
+    /// FOOD component.
+    pub fn entity_used(&mut self, now: i64, entity: &str, held_item: &str, held_is_food: bool) {
+        let speech = self.detector.entity_used(
+            entity,
+            held_item,
+            held_is_food,
+            now,
+            &self.pack,
+            &self.config,
+        );
+        self.apply(speech, now);
+    }
+
+    /// The entities watched for a kill: report those dying or gone in
+    /// [`WorldTick::entity_fates`].
+    pub fn watched_entities(&self) -> impl Iterator<Item = u64> + '_ {
+        self.detector.watched()
+    }
+
     /// One client tick in a world, not paused: narration for the tick's state, then the quiz.
     pub fn world_tick(&mut self, input: &WorldTick<'_>) -> Option<QuizEvent> {
+        self.integrated_server = input.integrated_server;
+        self.hardcore = input.hardcore;
         let speech = self.detector.tick(input, &self.pack, &self.config);
         self.apply(speech, input.now);
         let event = self.quiz.tick(
@@ -179,6 +323,21 @@ impl Teacher {
         self.config.enabled
     }
 
+    /// The speed key: the pack's next speed. The next clips play its sound events. Returns the
+    /// speed now.
+    pub fn cycle_speed(&mut self) -> &str {
+        let speeds = &self.pack.speeds;
+        if !speeds.is_empty() {
+            let current = self.pack.speed(&self.config.speed);
+            let next = speeds
+                .iter()
+                .position(|speed| speed == current)
+                .map_or(0, |index| (index + 1) % speeds.len());
+            self.config.speed = speeds[next].clone();
+        }
+        &self.config.speed
+    }
+
     /// The mute key: his sound off or on; text and questions stay. Returns whether he is muted.
     pub fn toggle_mute(&mut self, now: i64) -> bool {
         self.config.muted = !self.config.muted;
@@ -199,9 +358,33 @@ impl Teacher {
         Some(self.answered(answer, now))
     }
 
-    /// The question screen's tick: a time-out answers wrong.
+    /// The question screen's tick: a choice answers wrong at its time-out, a typed question
+    /// submits what [`Teacher::set_typed`] last gave.
     pub fn question_tick(&mut self, now: i64) -> Option<Outcome> {
-        let answer = self.quiz.screen_tick(now)?;
+        let typing = self
+            .quiz
+            .open()
+            .is_some_and(|open| open.kind == QuestionKind::Typing);
+        let answer = if typing {
+            let words = words(&mut self.typed_words, &self.pack);
+            self.quiz.screen_tick(now, words)
+        } else {
+            self.quiz.screen_tick(now, &PackWords::default())
+        }?;
+        Some(self.answered(answer, now))
+    }
+
+    /// The typed question's edit box changed. What it holds is submitted at the time-out and
+    /// kept while the question is suspended ([`OpenQuestion::typed`]).
+    pub fn set_typed(&mut self, typed: &str) {
+        self.quiz.set_typed(typed);
+    }
+
+    /// Enter or the Check button on a typed question. `None` in the 400 ms lockout and with an
+    /// empty box.
+    pub fn submit_typed(&mut self, now: i64, typed: &str) -> Option<Outcome> {
+        let words = words(&mut self.typed_words, &self.pack);
+        let answer = self.quiz.submit_typed(typed, now, words)?;
         Some(self.answered(answer, now))
     }
 
@@ -257,14 +440,14 @@ impl Teacher {
     pub fn portrait_frame(&mut self, now: i64) -> i32 {
         let mouth = self.speaker.mouth(now, &self.pack);
         let speaking = self.speaker.is_speaking();
-        let frowning = self.quiz.frowning(now);
         self.portrait.frame(
             now,
             &self.pack.meta.sprite,
             mouth,
             speaking,
             self.quiz.hop_at(),
-            frowning,
+            self.quiz.angry(now),
+            self.quiz.frowning(now),
         )
     }
 
@@ -296,8 +479,36 @@ impl Teacher {
                     self.speaker
                         .say_ongoing(&phrase, repeat, &self.config, &self.progress, now);
                 }
+                Speech::Now(phrase) => self.speaker.say_now(&phrase, false, &self.config, now),
                 Speech::DropQueued(id) => self.speaker.drop_queued(&id),
                 Speech::HeldLabel(phrase) => self.held_label = Some((phrase, now)),
+                Speech::Counted {
+                    display,
+                    clips,
+                    joined: true,
+                    fresh,
+                } => {
+                    if let [start, noun] = clips.as_slice() {
+                        self.speaker
+                            .say_joined(&display, start, noun, fresh, &self.config, now);
+                    }
+                }
+                Speech::Counted {
+                    display,
+                    clips,
+                    joined: false,
+                    fresh,
+                } => {
+                    self.speaker.say_sequence(
+                        &display,
+                        &clips,
+                        fresh,
+                        &self.config,
+                        &self.progress,
+                        now,
+                    );
+                }
+                Speech::Died => self.progress.record_death(self.hardcore, &self.config),
             }
         }
     }
@@ -314,10 +525,16 @@ impl Teacher {
         }
     }
 
-    /// Records the answer, says the learned line when it made the phrase learned, then says the
-    /// right sentence at once.
+    /// Records the answer, says the learned line when it made the phrase learned, decides the
+    /// consequences, says the right sentence at once, and counts the answer toward the angry
+    /// teacher, whose line comes after it. No exam is ported, so every answer has consequences
+    /// (an exam answer would have them only with `examPenalties`).
     fn answered(&mut self, answer: Answer, now: i64) -> Outcome {
-        let Answer { question, correct } = answer;
+        let Answer {
+            question,
+            correct,
+            typed,
+        } = answer;
         let was_learned = self.progress.is_learned(&question.id, &self.config);
         self.progress.answered(&question.id, correct, now);
         let learned =
@@ -332,11 +549,48 @@ impl Teacher {
                 self.speaker.say(phrase, &self.config, &self.progress, now);
             }
         }
+        let mut server = consequences::decide(
+            correct,
+            self.integrated_server,
+            self.hardcore,
+            &self.config,
+            &mut self.progress,
+            &mut self.rng,
+        );
         self.speaker.say_now(&question, false, &self.config, now);
+        let angry = self.quiz.angry_after(correct, &self.config, now).then(|| {
+            if self.config.angry_teacher == "drop" {
+                Wipe::Drop
+            } else {
+                Wipe::Delete
+            }
+        });
+        if let Some(wipe) = angry {
+            if let Some(phrase) = self.pack.phrase("angry") {
+                self.speaker.say(phrase, &self.config, &self.progress, now);
+            }
+            if let Some(actions) = &mut server {
+                actions.push(ServerAction::Wipe(wipe));
+            }
+        }
         Outcome {
             question,
             correct,
             learned,
+            typed: typed.map(|(text, verdict)| Typed { text, verdict }),
+            server,
+            angry,
         }
     }
+
+    /// Drains the speaker's queue, for the core's tests.
+    #[cfg(test)]
+    pub(crate) fn take_queued(&mut self) -> Vec<String> {
+        self.speaker.take_queued()
+    }
+}
+
+/// The pack's words for judging typed answers, built once.
+fn words<'a>(cache: &'a mut Option<PackWords>, pack: &Pack) -> &'a PackWords {
+    cache.get_or_insert_with(|| PackWords::new(pack.phrases().iter().map(|p| p.text.as_str())))
 }
