@@ -76,6 +76,10 @@ const KEPT: &[u8] = br#"{"worlds": {"server:earlier": {}}}"#;
 /// A config from an earlier session that does not parse.
 const BAD_CONFIG: &[u8] = br#"{"enabled": fals"#;
 
+/// The integrated server's half keeps process-wide state, which this session (the host's UUID,
+/// the server stopping) and the server test both write: each holds this for its whole run.
+pub(super) static SERVER_STATE: Mutex<()> = Mutex::new(());
+
 /// What the scripted client holds and what the mod did to it.
 #[derive(Default)]
 struct Session {
@@ -505,6 +509,7 @@ fn settings_page() -> Option<Page> {
 
 #[test]
 fn hooks_drive_the_teacher() {
+    let _server = lock(&SERVER_STATE);
     let io = Arc::new(TestClient::default());
     io.session().now = START;
     // The progress of an earlier session, in a file that cannot be read now.

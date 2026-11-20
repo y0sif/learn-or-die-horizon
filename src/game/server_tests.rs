@@ -10,17 +10,17 @@
 //! to do.
 use super::super::detect::HostFacts;
 use super::super::payload::{Action, Consequences};
-use super::{HOST_PLAYER, SEEN, Seen, entity_used, kill_credit, lock, receive, ticked};
+use super::{HOST_PLAYER, SEEN, Seen, kill_credit, lock, receive, ticked};
 use crate::core::{Effect, ServerAction, Wipe};
 use mod_api::__private::game::{BackendMutRefOf, BackendRefOf};
 use mod_api::prelude::*;
-use mod_api::testing::FakeHost;
+use mod_api::testing::{FakeHost, with_mods};
 use mod_api::{
     AttributeModifier, AttributeOperation, Backend, BackendMut, BackendMutRef, BackendRef,
     BlockShapeKind, BlockState, Commands, Compound, EntityRef, EntityTypeKey, FishingHookRef, Hand,
-    Host, Identifier, ItemKey, ItemStack, LevelRef, LivingRef, ModifierLifetime,
-    PAYLOAD_DECODE_BUDGET, PlayerDataRefusal, PlayerRef, ServerHost, StackWriteError, Tag,
-    decode_payload, encode_payload,
+    Host, HostSide, Identifier, ItemKey, ItemStack, LevelRef, LivingRef, ModEntry,
+    ModifierLifetime, PAYLOAD_DECODE_BUDGET, PlayerDataRefusal, PlayerRef, ServerHost,
+    StackWriteError, Tag, decode_payload, encode_payload,
 };
 use std::collections::BTreeMap;
 
@@ -479,6 +479,7 @@ struct Row {
 
 #[test]
 fn consequences_reach_the_host_player() {
+    let _server = lock(&crate::game::tests::SERVER_STATE);
     let effect = |id, seconds, level| ServerAction::Effect(Effect { id, seconds, level });
     let lost = |lost: i32| ServerAction::LostHearts {
         lost,
@@ -707,7 +708,18 @@ fn consequences_reach_the_host_player() {
             if let Some(colour) = tick.dyed {
                 ticked(&mut host, player, false);
                 host.colour = colour;
-                entity_used(SHEEP as i32);
+                // The right click goes through the mod's hooks, on the server.
+                let mods = vec![ModEntry::new("learnordie", crate::hooks())];
+                with_mods(mods.into(), || {
+                    mod_api::dispatch_entity_interact(
+                        HostSide::Server(&mut host),
+                        Hand::Main,
+                        SHEEP as i32,
+                        "minecraft:sheep",
+                        None,
+                        &mut None,
+                    );
+                });
                 facts = ticked(&mut host, player, false);
                 assert_eq!(host.nbt_reads, 2, "{name}: read twice in three ticks");
             }
