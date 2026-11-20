@@ -1,22 +1,27 @@
 //! This mod's screen. It shows the open question, as four options (Java `QuizScreen`, here) or
-//! as an edit box ([`super::typing`]), or a settings page ([`super::settings`]); this module
-//! sends each screen hook to the one showing.
+//! as an edit box ([`super::typing`]), or a settings page ([`super::settings`]), the exam's
+//! result ([`super::exam`]), the dictionary ([`super::dictionary`]) or the guide
+//! ([`super::guide`]); this module sends each screen hook to the one showing.
 //!
 //! The choice question: the item's picture, the English prompt (or a replay button for a
-//! listening question), the timer bar and four German options as buttons. Keys 1 to 4 and a
-//! click answer (both ignored for the first 700 ms); Esc suspends the question and the pause menu
-//! opens (the `quiz_escape` mixin), and it comes back with the time left once no screen is open.
+//! listening question), the timer bar and four German options as buttons; an exam's question has
+//! "Question N of M" at the card's top. Keys 1 to 4 and a click answer (both ignored for the
+//! first 700 ms); Esc suspends the question and the pause menu opens (the `quiz_escape` mixin),
+//! and it comes back with the time left once no screen is open.
 //!
 //! The input hooks' host only reads, so an answer is recorded here and the next client tick
 //! closes the screen and writes the chat line.
 use super::hud::{self, GOLD, frame, panel, width};
-use super::{ESCAPE_PAUSE, Game, QUIZ_PAUSES, STATE, State, lock, settings, sound, typing};
-use crate::core::{OpenQuestion, Phrase, QuestionKind, Teacher};
+use super::{
+    ESCAPE_PAUSE, Game, QUIZ_PAUSES, STATE, State, dictionary, guide, lock, number, settings,
+    sound, typing,
+};
+use crate::core::{ExamStage, OpenQuestion, Phrase, QuestionKind, Teacher};
 use mod_api::client::hud_layout::PoseOp;
 use mod_api::{
     ClientHost, DrawContext, Flow, GuiDraw, Identifier, ScreenCharTypedPreEvent,
     ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
-    ScreenMouseDraggedPreEvent, ScreenRenderPostEvent, Text,
+    ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent, Text,
 };
 use std::sync::atomic::Ordering;
 
@@ -139,6 +144,46 @@ pub(super) fn centred_text(
     }
 }
 
+/// A text `scale` times its size with its top left at `at`, in one batch.
+pub(super) fn scaled(
+    draw: &mut dyn DrawContext,
+    text: Text,
+    [x, y]: [f32; 2],
+    scale: f32,
+    colour: u32,
+) {
+    let ops = [
+        GuiDraw::Push(vec![PoseOp::Translate(x, y), PoseOp::Scale(scale, scale)]),
+        GuiDraw::Text {
+            text,
+            x: 0,
+            y: 0,
+            color: colour,
+            shadow: true,
+        },
+        GuiDraw::Pop,
+    ];
+    if let Err(e) = draw.gui_paint(&ops) {
+        super::log_warn(format!("could not draw a text: {e:?}"));
+    }
+}
+
+/// An exam question's header at the card's top left, `x0 + 8, top + 6` (Java
+/// `QuizManager.questionHeader`, drawn by `QuizScreen` and `TypingScreen`).
+pub(super) fn exam_header(
+    draw: &mut dyn DrawContext,
+    teacher: &Teacher,
+    [x0, top]: [f32; 2],
+    now: i64,
+) {
+    if let ExamStage::Asking { number: n, total } = teacher.exam(now)
+        && n <= total
+    {
+        let header = Text::translate("learnordie.exam.header", vec![number(n), number(total)]);
+        scaled(draw, header, [x0 + 8.0, top + 6.0], 1.0, PROMPT);
+    }
+}
+
 /// `NarratorHud.timeBar`.
 fn time_bar(draw: &mut dyn DrawContext, [x0, y, w]: [f32; 3], fraction: f32) {
     let f = fraction.clamp(0.0, 1.0);
@@ -217,6 +262,18 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
         settings::render(host, io, draw, teacher, game, mouse);
         return;
     }
+    if let Some(page) = game.result.as_mut() {
+        page.render(host, io, draw, mouse);
+        return;
+    }
+    if game.dictionary.is_some() {
+        dictionary::render(host, io, draw, teacher, game, mouse);
+        return;
+    }
+    if let Some(page) = game.guide.as_mut() {
+        page.render(host, io, draw, teacher, mouse);
+        return;
+    }
     let Some(open) = showing(teacher) else {
         return;
     };
@@ -236,6 +293,7 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
     let bottom = layout.option(3)[1] + BUTTON_H + 10.0;
     panel(draw, [x0, mid - 130.0, x0 + card_w, bottom], 255);
     picture(draw, host, game, open, [cx, mid]);
+    exam_header(draw, teacher, [x0, mid - 130.0], now);
 
     let title = if open.listening {
         "learnordie.quiz.listen"
@@ -299,6 +357,15 @@ pub(crate) fn key_pressed(host: &dyn ClientHost, event: &mut ScreenKeyPressedPre
     if game.settings.is_some() {
         return settings::key_pressed(host, io, teacher, game, key, modifiers);
     }
+    if let Some(page) = game.result.as_mut() {
+        return page.key_pressed(host, io, key, modifiers);
+    }
+    if game.dictionary.is_some() {
+        return dictionary::key_pressed(host, io, teacher, game, key, modifiers);
+    }
+    if game.guide.is_some() {
+        return guide::key_pressed(host, io, teacher, game, key, modifiers);
+    }
     if showing(teacher).is_some_and(|open| open.kind == QuestionKind::Typing) {
         return typing::key_pressed(host, io, teacher, game, key, modifiers, now);
     }
@@ -332,15 +399,18 @@ pub(crate) fn char_typed(host: &dyn ClientHost, event: &mut ScreenCharTypedPreEv
     let Some(teacher) = teacher.as_mut() else {
         return Flow::Continue;
     };
-    if game.settings.is_some()
-        || !showing(teacher).is_some_and(|open| open.kind == QuestionKind::Typing)
+    if let Some(page) = game.dictionary.as_mut() {
+        return page.char_typed(host, io, teacher, event.c);
+    }
+    if game.panel_open() || !showing(teacher).is_some_and(|open| open.kind == QuestionKind::Typing)
     {
         return Flow::Continue;
     }
     typing::char_typed(host, io, teacher, game, event.c, now)
 }
 
-/// A mouse button let go: a drag on the typed question's box or a settings slider ends.
+/// A mouse button let go: a drag on the typed question's box, a settings slider or the
+/// dictionary's list ends.
 pub(crate) fn mouse_released(
     host: &dyn ClientHost,
     event: &mut ScreenMouseButtonReleasedPreEvent<'_>,
@@ -353,6 +423,12 @@ pub(crate) fn mouse_released(
     let game = &mut state.game;
     let input = if let Some(page) = game.settings.as_mut() {
         page.released(event.button)
+    } else if let Some(page) = game.dictionary.as_mut() {
+        page.released(event.button)
+    } else if let Some(page) = game.result.as_mut() {
+        page.released(event.button)
+    } else if let Some(page) = game.guide.as_mut() {
+        page.released(event.button)
     } else if let Some(typing) = game.typing.as_mut() {
         typing.released(event.button)
     } else {
@@ -361,7 +437,8 @@ pub(crate) fn mouse_released(
     if input { Flow::Cancel } else { Flow::Continue }
 }
 
-/// The pointer moved with a button held: the box's selection or a settings slider follows it.
+/// The pointer moved with a button held: the box's selection, a settings slider or the
+/// dictionary's list follows it.
 pub(crate) fn mouse_dragged(
     host: &dyn ClientHost,
     event: &mut ScreenMouseDraggedPreEvent<'_>,
@@ -379,6 +456,10 @@ pub(crate) fn mouse_dragged(
     let (at, button) = (event.screen.mouse, event.button);
     let taken = if game.settings.is_some() {
         settings::dragged(host, io, teacher, game, at, button)
+    } else if let Some(page) = game.dictionary.as_mut() {
+        page.dragged(host, io, at, button)
+    } else if game.panel_open() {
+        false
     } else if let Some(typing) = game.typing.as_mut() {
         typing.dragged(host, io, at, button)
     } else {
@@ -387,14 +468,15 @@ pub(crate) fn mouse_dragged(
     if taken { Flow::Cancel } else { Flow::Continue }
 }
 
-/// A left click on an option answers it; on the replay button it plays the phrase again.
+/// A left click on an option answers it; on the replay button it plays the phrase again. The
+/// dictionary takes the right and middle buttons too.
 pub(crate) fn mouse_pressed(
     host: &dyn ClientHost,
     event: &mut ScreenMouseButtonPressedPreEvent<'_>,
 ) -> Flow {
     let io = super::io();
     let io = &*io;
-    if event.button != 0 || !io.our_screen(host) {
+    if !io.our_screen(host) {
         return Flow::Continue;
     }
     let now = io.now();
@@ -404,8 +486,20 @@ pub(crate) fn mouse_pressed(
     let Some(teacher) = teacher.as_mut() else {
         return Flow::Continue;
     };
+    if game.dictionary.is_some() {
+        return dictionary::mouse_pressed(host, io, teacher, game, mouse, event.button);
+    }
+    if event.button != 0 {
+        return Flow::Continue;
+    }
     if game.settings.is_some() {
         return settings::mouse_pressed(host, io, teacher, game, mouse, event.modifiers);
+    }
+    if let Some(page) = game.result.as_mut() {
+        return page.mouse_pressed(host, io, mouse, event.modifiers);
+    }
+    if game.guide.is_some() {
+        return guide::mouse_pressed(host, io, teacher, game, mouse, event.modifiers);
     }
     let Some(open) = showing(teacher) else {
         return Flow::Continue;
@@ -428,4 +522,26 @@ pub(crate) fn mouse_pressed(
         answered(game, outcome);
     }
     Flow::Cancel
+}
+
+/// The wheel over the screen: the exam's result or the dictionary's list scrolls.
+pub(crate) fn mouse_scrolled(
+    host: &dyn ClientHost,
+    event: &mut ScreenMouseScrolledPreEvent<'_>,
+) -> Flow {
+    let io = super::io();
+    if !io.our_screen(host) {
+        return Flow::Continue;
+    }
+    let mut state = lock(&STATE);
+    let game = &mut state.game;
+    let dy = event.scroll[1];
+    let taken = if let Some(page) = game.result.as_mut() {
+        page.scrolled(dy)
+    } else if let Some(page) = game.dictionary.as_mut() {
+        page.scrolled(event.screen.mouse, dy)
+    } else {
+        false
+    };
+    if taken { Flow::Cancel } else { Flow::Continue }
 }

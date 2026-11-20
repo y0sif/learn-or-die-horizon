@@ -1,6 +1,6 @@
 //! The typed question (Java `TypingScreen`), on this mod's screen: the picture, the English
 //! prompt (or a replay button for a listening question), the timer bar, an edit box of up to 160
-//! characters and a Check button, laid out as the original's.
+//! characters and a Check button, laid out as the original's; an exam's question has its header.
 //!
 //! The box is the SDK's text field, edited as the game's own `EditBox`; it takes every character
 //! a chat line may hold, so ä ö ü ß too. Enter or keypad Enter submits wherever the focus is, and
@@ -137,6 +137,7 @@ pub(super) fn render(
     let x0 = (cx - card_w / 2.0).round();
     panel(draw, [x0, mid - 130.0, x0 + card_w, mid + 74.0], 255);
     screen::picture(draw, host, game, open, [cx, mid]);
+    screen::exam_header(draw, teacher, [x0, mid - 130.0], now);
     let title = if open.listening {
         Text::translate("learnordie.quiz.type_heard", vec![])
     } else {

@@ -1,12 +1,13 @@
-//! The teacher's HUD layer (Java `NarratorHud`, the pilot's parts): his portrait in a corner with
-//! the lipsync mouth, the held item's noun over the hotbar, and the phrase he says in words
-//! coloured by their grammatical role with its translation under it.
+//! The teacher's HUD layer (Java `NarratorHud`, the parts the port has): his portrait in a corner
+//! with the lipsync mouth (hidden while the dictionary is open), the held item's noun over the
+//! hotbar, the phrase he says in words coloured by their grammatical role with its translation
+//! under it, and the exam's countdown or next question at the top left.
 //!
 //! Scaled text goes through one `gui_paint` batch per block, as the SDK's pose (`GuiDraw::Push`)
 //! holds only inside one batch. The portrait is drawn with `DrawContext::sprite`, which takes the
 //! pack's `textures/gui/teacher.png` as the GUI atlas sprite `zhnarrator_de:gui/teacher`.
-use super::{STATE, State, lock};
-use crate::core::Teacher;
+use super::{STATE, State, lock, number};
+use crate::core::{ExamStage, Teacher};
 use mod_api::client::hud_layout::PoseOp;
 use mod_api::{
     ClientHost, DrawContext, GuiDraw, GuiLayer, GuiLayerDrawEvent, GuiLayerPlacement,
@@ -78,9 +79,38 @@ pub(crate) fn draw(_host: &dyn ClientHost, event: &mut GuiLayerDrawEvent<'_>) {
     }
     let draw = &mut *event.draw;
     let [w, h] = draw.size();
-    portrait(draw, teacher, now, [w, h]);
+    if game.dictionary.is_none() {
+        portrait(draw, teacher, now, [w, h]);
+    }
     held_label(draw, teacher, now, [w, h]);
     spoken(draw, teacher, now, [w, h]);
+    exam_line(draw, teacher, now);
+}
+
+/// The exam's line (`NarratorHud.examLine`), where the original draws its timer line with no
+/// counter: the top left, 6 px in, gold. "Exam in m:ss" while it counts down; between its
+/// questions, the one that comes next.
+fn exam_line(draw: &mut dyn DrawContext, teacher: &Teacher, now: i64) {
+    let text = match teacher.exam_hud(now) {
+        Some(ExamStage::Playing { left }) => {
+            Text::translate("learnordie.exam.timer", vec![Text::literal(left)])
+        }
+        Some(ExamStage::Asking { number: n, total }) => Text::translate(
+            "learnordie.exam.timer_asking",
+            vec![number(n), number(total)],
+        ),
+        Some(ExamStage::Off) | None => return,
+    };
+    let line = GuiDraw::Text {
+        text,
+        x: 6,
+        y: 6,
+        color: with_alpha(LABEL, 255),
+        shadow: true,
+    };
+    if let Err(e) = draw.gui_paint(&[line]) {
+        super::log_warn(format!("could not draw the exam line: {e:?}"));
+    }
 }
 
 /// `renderPortrait`: the frame the core picks, at `hudPortraitScale` in half steps, standing on the

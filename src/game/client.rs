@@ -2,12 +2,13 @@
 //! makes goes through [`Client`]. [`HostClient`] answers from the game; the wiring test installs
 //! its own, because the SDK's fake host has no client backend and panics on client calls.
 //!
-//! The SDK's widgets (the typed question's edit box, the settings buttons) ask their host for
-//! the game's clock, the clipboard and the click sound: [`WidgetHost`] answers those through the
-//! seam too.
+//! The SDK's widgets (the typed question's edit box, the settings buttons, the dictionary's tabs
+//! and search box) ask their host for the game's clock, the clipboard and the click sound:
+//! [`WidgetHost`] answers those through the seam too.
 use super::{MOD_ID, detect};
 use crate::core::{Fate, ServerAction};
 use mod_api::prelude::{ClientInputClientHost, EffectsClientHost};
+use mod_api::text::TextContent;
 use mod_api::{
     BlockBreakingState, BlockClick, ClientHost, ConfigFileError, ConfigFiles, ConfigPath,
     CrosshairTarget, EntityRef, EquipmentSlot, Hand, Host, Identifier, ItemStack, LevelRef,
@@ -124,6 +125,15 @@ pub struct Struck {
     pub dying: bool,
 }
 
+/// What the crosshair is on, for the "what is this" key.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Aim {
+    /// A block, by its id.
+    Block(String),
+    /// An entity, by its network id and its type id.
+    Entity { id: u32, kind: String },
+}
+
 /// A right click on a block, as the place check reads it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Click {
@@ -201,6 +211,29 @@ pub trait Client: Send + Sync {
     fn used_item(&self, host: &dyn ClientHost, stack: Option<&ItemStack>) -> (String, bool);
     /// Of the entities `watched` (network ids), those dying now or gone.
     fn entity_fates(&self, host: &dyn ClientHost, watched: &[u64]) -> Vec<(u64, Fate)>;
+    /// The block or entity under the crosshair (`Minecraft.hitResult`).
+    fn crosshair(&self, host: &dyn ClientHost) -> Option<Aim>;
+    /// The key the mod's mapping `id` is bound to, as Controls names it (`keyName`).
+    fn key_name(&self, host: &dyn ClientHost, id: &str) -> Text;
+    /// The game's name for a dictionary hint's thing (`DictionaryScreen.itemName`): the entity
+    /// type's when `minecraft:<key>` is an entity type and not an item, else the hover name of
+    /// `picture`, the item drawn for the key. `None` for neither.
+    fn game_name(&self, host: &dyn ClientHost, key: &str, picture: Option<&str>) -> Option<String>;
+}
+
+/// A key's name as Controls shows it (`InputConstants.Key.getDisplayName`): a letter or digit key
+/// as its character in upper case, any other by its lang key (`key.keyboard.right.shift`).
+pub(crate) fn key_display(key: &str) -> Text {
+    let rest = key.strip_prefix("key.keyboard.").unwrap_or(key);
+    let mut chars = rest.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        return Text::literal(c.to_uppercase().to_string());
+    }
+    let mut text = Text::translate(key, vec![]);
+    if let TextContent::Translatable { fallback, .. } = &mut text.content {
+        *fallback = Some(rest.to_string());
+    }
+    text
 }
 
 /// The host the SDK's widgets run with: their clock, the clipboard and the button click go
@@ -646,5 +679,39 @@ impl Client for HostClient {
                 }
             })
             .collect()
+    }
+
+    fn crosshair(&self, host: &dyn ClientHost) -> Option<Aim> {
+        match host.crosshair_target()? {
+            CrosshairTarget::Block { state, .. } => Some(Aim::Block(state.block().id(host))),
+            CrosshairTarget::Entity { entity, .. } => Some(Aim::Entity {
+                id: entity.id(),
+                kind: entity.kind(host)?.id(host),
+            }),
+            _ => None,
+        }
+    }
+
+    fn key_name(&self, host: &dyn ClientHost, id: &str) -> Text {
+        host.mod_key(MOD_ID, id)
+            .map_or_else(|| Text::literal("?"), |(key, _)| key_display(&key))
+    }
+
+    fn game_name(&self, host: &dyn ClientHost, key: &str, picture: Option<&str>) -> Option<String> {
+        let id = format!("minecraft:{key}");
+        let item = Identifier::parse(&id)
+            .ok()
+            .and_then(|id| host.item_key(&id));
+        let entity = host
+            .entity_type_keys()
+            .iter()
+            .any(|kind| kind.id(host) == id);
+        if entity && item.is_none() {
+            let name = Text::translate(format!("entity.minecraft.{key}"), vec![]);
+            return Some(self.tr(host, &name));
+        }
+        let item = host.item_key(&Identifier::parse(picture?).ok()?)?;
+        let name = host.hover_name(&ItemStack::of(item));
+        (!name.is_empty()).then_some(name)
     }
 }

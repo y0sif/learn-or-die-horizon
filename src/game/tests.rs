@@ -1,28 +1,29 @@
 //! The wiring: one scripted session dispatches the client hooks through the SDK's test support
 //! and checks what the teacher played, drew, asked and saved. The client seam answers the client
 //! reads and writes the fake host cannot; the pack is invented for the test.
-use super::client::{Click, Client, Store, Struck, View};
+use super::client::{Aim, Click, Client, Store, Struck, View};
 use super::hud::LAYER;
 use super::settings::Page;
 use super::{
     NO_SERVER_LINE, files, keys, lock, quiz_pauses, set_io, take_escape_pause, take_log_lines,
     with_state, world,
 };
-use crate::core::{Fate, QuestionKind, ServerAction};
+use crate::core::{ExamStage, Fate, Phrase, QuestionKind, ServerAction};
 use mod_api::client::widgets::{TextFieldLayout, TextFieldView};
 use mod_api::serde_json::{self, Value};
 use mod_api::testing::{FakeHost, with_mods};
 use mod_api::text::TextContent;
 use mod_api::{
-    BlockClick, BlockHit, ClientHost, DrawContext, EntityRef, GuiDraw, Hand, HostSide,
-    InteractionAttempt, InteractionKey, InteractionResult, ItemKey, ItemStack, KeyAction,
+    BlockClick, BlockHit, ClientHost, DrawContext, EntityRef, GuiClipRefusal, GuiDraw, Hand,
+    HostSide, InteractionAttempt, InteractionKey, InteractionResult, ItemKey, ItemStack, KeyAction,
     LevelDimension, LogicalSide, ModEntry, ScreenView, SoundPlay, SoundRef, SoundSource, Text,
     TextFormError, TriState,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Every phrase has an umlaut, so any one asked to type can be answered with it folded.
+/// Every phrase has an umlaut, so any one asked to type can be answered with it folded. The
+/// sentences have their words, for the dictionary; the nouns (`hold`) are one piece.
 const PHRASES: &str = r#"{
   "meta": {"name": "Testisch", "ui": {"correct": "Ja!", "wrong": "Nein!"}, "portrait": {"frames": 9}},
   "voices": ["v1"],
@@ -36,23 +37,49 @@ const PHRASES: &str = r#"{
   "phrases": [
     {"id": "break.bloop", "action": "break", "key": "bloop", "text": "Ich zerbreche den Blööp.", "en": "I break the bloop.",
      "parts": [{"text": "Ich", "role": "pron"}, {"text": "zerbreche", "role": "verb"}, {"text": "den", "role": "part"}, {"text": "Blööp", "role": "obj"}]},
-    {"id": "place.bloop", "action": "place", "key": "bloop", "text": "Ich setze den Blööp.", "en": "I set the bloop."},
-    {"id": "pickup.bloop", "action": "pickup", "key": "bloop", "text": "Ich nehme den Blööp.", "en": "I take the bloop."},
+    {"id": "place.bloop", "action": "place", "key": "bloop", "text": "Ich setze den Blööp.", "en": "I set the bloop.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "setze", "role": "verb"}, {"text": "den", "role": "part"}, {"text": "Blööp", "role": "obj"}]},
+    {"id": "pickup.bloop", "action": "pickup", "key": "bloop", "text": "Ich nehme den Blööp.", "en": "I take the bloop.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "nehme", "role": "verb"}, {"text": "den", "role": "part"}, {"text": "Blööp", "role": "obj"}]},
     {"id": "hold.bloop", "action": "hold", "key": "bloop", "text": "der Blööp", "en": "bloop"},
     {"id": "hold.quux", "action": "hold", "key": "quux", "text": "das Quäx", "en": "quux"},
-    {"id": "pickup.quux", "action": "pickup", "key": "quux", "text": "Ich nehme das Quäx.", "en": "I take the quux."},
-    {"id": "break.zap", "action": "break", "key": "zap", "text": "Ich zerbreche den Zäp.", "en": "I break the zap."},
-    {"id": "use.zing", "action": "use", "key": "zing", "text": "Ich benütze das Zing.", "en": "I use the zing."},
-    {"id": "hungry", "action": "hungry", "text": "Ich möchte essen.", "en": "I want to eat."},
-    {"id": "drop.bloop", "action": "drop", "key": "bloop", "text": "Ich lasse den Blööp fallen.", "en": "I let the bloop fall."},
-    {"id": "burning", "action": "burning", "text": "Ich glühe.", "en": "I glow."},
-    {"id": "fish", "action": "fish", "text": "Ich fänge Fische.", "en": "I catch fish."}
+    {"id": "pickup.quux", "action": "pickup", "key": "quux", "text": "Ich nehme das Quäx.", "en": "I take the quux.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "nehme", "role": "verb"}, {"text": "das", "role": "part"}, {"text": "Quäx", "role": "obj"}]},
+    {"id": "break.zap", "action": "break", "key": "zap", "text": "Ich zerbreche den Zäp.", "en": "I break the zap.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "zerbreche", "role": "verb"}, {"text": "den", "role": "part"}, {"text": "Zäp", "role": "obj"}]},
+    {"id": "use.zing", "action": "use", "key": "zing", "text": "Ich benütze das Zing.", "en": "I use the zing.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "benütze", "role": "verb"}, {"text": "das", "role": "part"}, {"text": "Zing", "role": "obj"}]},
+    {"id": "hungry", "action": "hungry", "text": "Ich möchte essen.", "en": "I want to eat.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "möchte", "role": "verb"}, {"text": "essen", "role": "part"}]},
+    {"id": "drop.bloop", "action": "drop", "key": "bloop", "text": "Ich lasse den Blööp fallen.", "en": "I let the bloop fall.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "lasse", "role": "verb"}, {"text": "den", "role": "part"}, {"text": "Blööp", "role": "obj"}, {"text": "fallen", "role": "adj"}]},
+    {"id": "burning", "action": "burning", "text": "Ich glühe.", "en": "I glow.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "glühe", "role": "verb"}]},
+    {"id": "fish", "action": "fish", "text": "Ich fänge Fische.", "en": "I catch fish.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "fänge", "role": "verb"}, {"text": "Fische", "role": "part"}]},
+    {"id": "word.bloop", "action": "word", "key": "bloop", "text": "Blööp", "en": "bloop"}
   ]
 }"#;
 
+/// Every phrase but the word has an entry, so whichever the session learns is listed.
+const DICTIONARY: &str = r#"{"entries": {
+  "break.bloop": {"h": ["w.wer", "w.tun", "w.den"], "n": [["fall", "w.akk"]], "f": [["Er zerbricht ihn.", "", "er"]]},
+  "place.bloop": {"h": ["w.wer"], "n": [["fall", "w.akk"]], "f": [["Formel", "", "er"]]},
+  "pickup.bloop": {"h": ["w.wer"], "n": [["fall", "w.akk"]], "f": [["Formel", "", "er"]]},
+  "hold.bloop": {"h": ["w.der"], "n": [["fall", "w.nom"]], "f": [["Formel", "", "er"]]},
+  "hold.quux": {"h": ["w.das"], "n": [["fall", "w.nom"]], "f": [["Formel", "", "er"]]},
+  "pickup.quux": {"h": ["w.wer"], "n": [["fall", "w.akk"]], "f": [["Formel", "", "er"]]},
+  "break.zap": {"h": ["w.wer"], "n": [["fall", "w.akk"]], "f": [["Formel", "", "er"]]},
+  "use.zing": {"h": ["w.wer"], "n": [["fall", "w.akk"]], "f": [["Formel", "", "er"]]},
+  "hungry": {"h": ["w.wer"], "n": [["fall", "w.nom"]], "f": [["Formel", "", "er"]]},
+  "drop.bloop": {"h": ["w.wer"], "n": [["fall", "w.akk"]], "f": [["Formel", "", "er"]]},
+  "burning": {"h": ["w.wer"], "n": [["fall", "w.nom"]], "f": [["Formel", "", "er"]]},
+  "fish": {"h": ["w.wer"], "n": [["fall", "w.akk"]], "f": [["Formel", "", "er"]]}
+}}"#;
+
 const LIPSYNC: &str = r#"{"window": 40, "clips": {"v1.normal.hold.quux": "1221"}}"#;
 
-const IDS: [&str; 12] = [
+const IDS: [&str; 13] = [
     "break.bloop",
     "place.bloop",
     "pickup.bloop",
@@ -65,6 +92,7 @@ const IDS: [&str; 12] = [
     "drop.bloop",
     "burning",
     "fish",
+    "word.bloop",
 ];
 const SPEEDS: [&str; 2] = ["normal", "slow"];
 const START: i64 = 1_700_000_000_000;
@@ -88,8 +116,10 @@ struct Session {
     seat: usize,
     view: Option<View>,
     blocks: HashMap<[i32; 3], String>,
-    /// The block under the crosshair.
+    /// The block under the crosshair, for the attack key.
     aim: Option<[i32; 3]>,
+    /// What the crosshair is on, for the "what is this" key.
+    looked: Option<Aim>,
     clicks: Vec<&'static str>,
     screen: bool,
     opened: usize,
@@ -244,6 +274,7 @@ impl Client for TestClient {
         match id {
             "zhnarrator_de:phrases.json" => Some(PHRASES.into()),
             "zhnarrator_de:lipsync.json" => Some(LIPSYNC.into()),
+            "zhnarrator_de:dictionary.json" => Some(DICTIONARY.into()),
             _ => None,
         }
     }
@@ -303,6 +334,16 @@ impl Client for TestClient {
     fn entity_fates(&self, _: &dyn ClientHost, _: &[u64]) -> Vec<(u64, Fate)> {
         Vec::new()
     }
+    fn crosshair(&self, _: &dyn ClientHost) -> Option<Aim> {
+        self.session().looked.clone()
+    }
+    /// A key by its mapping's id, so chat lines name it plainly.
+    fn key_name(&self, _: &dyn ClientHost, id: &str) -> Text {
+        Text::literal(id)
+    }
+    fn game_name(&self, _: &dyn ClientHost, _: &str, _: Option<&str>) -> Option<String> {
+        None
+    }
 }
 
 /// Records what the HUD and the screen draw.
@@ -314,6 +355,8 @@ struct Canvas {
     sprites: Vec<String>,
     /// Each button's label and rectangle.
     buttons: Vec<(String, [f32; 4])>,
+    /// The labels of the buttons drawn greyed out.
+    inactive: Vec<String>,
     /// Each text field's text and rectangle.
     fields: Vec<(String, [f32; 4])>,
 }
@@ -332,6 +375,20 @@ impl Canvas {
         found
             .unwrap_or_else(|| panic!("no {part} in {:?}", self.buttons))
             .1
+    }
+
+    /// Every button and text field lies inside the screen (`ui` lists only those).
+    fn all_on_screen(&self) {
+        let [sw, sh] = self.size();
+        let widgets = self.buttons.iter().chain(&self.fields);
+        for (label, [x, y, w, h]) in widgets {
+            let on_screen = *x >= 0.0 && *y >= 0.0 && x + w <= sw && y + h <= sh;
+            assert!(on_screen, "{label} at {:?}", [x, y, w, h]);
+        }
+    }
+
+    fn shows(&self, text: &str) -> bool {
+        self.texts.iter().any(|t| t == text)
     }
 }
 
@@ -372,10 +429,23 @@ impl DrawContext for Canvas {
         &mut self,
         rect: [f32; 4],
         label: &Text,
-        _: bool,
+        active: bool,
         _: bool,
     ) -> Result<(), TextFormError> {
+        if !active {
+            self.inactive.push(plain(label));
+        }
         self.buttons.push((plain(label), rect));
+        Ok(())
+    }
+    fn push_clip(&mut self, _: [f32; 4]) -> Result<(), GuiClipRefusal> {
+        Ok(())
+    }
+    fn pop_clip(&mut self) -> Result<(), GuiClipRefusal> {
+        Ok(())
+    }
+    fn gui_tooltip(&mut self, lines: &[Text], _: [f32; 2]) -> Result<(), TextFormError> {
+        self.texts.extend(lines.iter().map(plain));
         Ok(())
     }
 }
@@ -507,6 +577,37 @@ fn settings_page() -> Option<Page> {
     with_state(|_, game| game.settings.as_ref().map(|page| page.page()))
 }
 
+/// Which of this mod's pages shows: the guide, the dictionary, the exam's result.
+fn pages() -> [bool; 3] {
+    with_state(|_, game| {
+        [
+            game.guide.is_some(),
+            game.dictionary.is_some(),
+            game.result.is_some(),
+        ]
+    })
+}
+
+/// The screen drawn in a `size` window, the mouse at `mouse`.
+fn drawn(host: &FakeHost, size: [f32; 2], mouse: [f32; 2]) -> Canvas {
+    let mut canvas = Canvas::sized(size);
+    mod_api::dispatch_screen_render_post(host, &mut canvas, &screen_at(mouse));
+    canvas
+}
+
+/// The chat lines equal to `line`.
+fn said_in_chat(io: &TestClient, line: &str) -> usize {
+    io.session()
+        .chat
+        .iter()
+        .filter(|seen| *seen == line)
+        .count()
+}
+
+const HINT: &str = "[Teacher] learnordie.guide.reopen[guide|settings]";
+/// The GUI size every page must fit.
+const SMALL: [f32; 2] = [350.0, 405.0];
+
 #[test]
 fn hooks_drive_the_teacher() {
     let _server = lock(&SERVER_STATE);
@@ -584,6 +685,67 @@ fn hooks_drive_the_teacher() {
                 .iter()
                 .any(|s| s == "zhnarrator_de:gui/teacher")
         );
+        // The exam counts down on its own from the world's first tick, its seconds rounded up.
+        assert!(
+            canvas.shows("learnordie.exam.timer[20:00]"),
+            "{:?}",
+            canvas.texts
+        );
+
+        // 3 s into the first world ever the guide opens on its own, `guideShown` saved at once.
+        // It pauses and fits the small window; Back is off on the first page, the last has no
+        // Skip, his angry face and Done, which closes it and leaves the hint in chat.
+        let opened = io.session().opened;
+        for _ in 0..60 {
+            if io.session().opened > opened {
+                break;
+            }
+            tick(&mut host, &io, 50);
+        }
+        assert_eq!(pages(), [true, false, false], "the guide opens on its own");
+        let config = io.file(Store::Config, files::CONFIG_FILE);
+        assert_eq!(
+            config.expect("config written")["guideShown"],
+            Value::Bool(true)
+        );
+        tick(&mut host, &io, 50);
+        assert!(quiz_pauses());
+        for page in 1..=4 {
+            let canvas = drawn(&host, SMALL, [0.0, 0.0]);
+            canvas.all_on_screen();
+            assert!(canvas.shows(&format!("learnordie.guide.page[{page}|4]")));
+            let skip = canvas
+                .buttons
+                .iter()
+                .any(|(l, _)| l == "learnordie.guide.skip");
+            assert_eq!(skip, page < 4, "Skip on page {page}");
+            let back_off = canvas.inactive.iter().any(|l| l == "learnordie.guide.back");
+            assert_eq!(back_off, page == 1, "Back on page {page}");
+            let face = canvas
+                .sprites
+                .iter()
+                .any(|s| s == "zhnarrator_de:gui/teacher");
+            assert_eq!(face, page == 4, "the angry face on page {page}");
+            let next = if page < 4 { "guide.next" } else { "guide.done" };
+            assert!(click_at(&host, canvas.button(next)));
+        }
+        tick(&mut host, &io, 50);
+        assert!(!io.session().screen);
+        assert_eq!(pages(), [false; 3]);
+        assert_eq!(said_in_chat(&io, HINT), 1);
+        assert_eq!(
+            said_in_chat(&io, "[Teacher] learnordie.tip.open[settings]"),
+            1
+        );
+        // U opens it again: not a first show, so Esc closes it with no hint.
+        io.session().clicks.push(keys::GUIDE);
+        tick(&mut host, &io, 50);
+        assert_eq!(pages(), [true, false, false], "U opens the guide");
+        assert!(!press(&host, &screen, "key.keyboard.escape"));
+        io.session().screen = false;
+        tick(&mut host, &io, 50);
+        assert_eq!(pages(), [false; 3]);
+        assert_eq!(said_in_chat(&io, HINT), 1);
 
         // A split-screen player's turn: its game shares this process, but its hooks leave the
         // teacher alone. Picking its profile it is in no world, which does not take him out of
@@ -666,8 +828,9 @@ fn hooks_drive_the_teacher() {
         assert!(io.said("place.bloop"));
 
         // A question a full interval after he first spoke: the ding, the screen, the pause.
+        let opened = io.session().opened;
         next_question(&mut host, &io);
-        assert_eq!(io.session().opened, 1);
+        assert_eq!(io.session().opened, opened + 1);
         let ding = io
             .session()
             .played
@@ -686,13 +849,13 @@ fn hooks_drive_the_teacher() {
             view.paused = true;
         });
         tick(&mut host, &io, 1000);
-        assert_eq!(io.session().opened, 1);
+        assert_eq!(io.session().opened, opened + 1);
         io.update(|view| {
             view.screen_open = false;
             view.paused = false;
         });
         tick(&mut host, &io, 50);
-        assert_eq!(io.session().opened, 2);
+        assert_eq!(io.session().opened, opened + 2);
 
         // The screen: four option buttons.
         io.update(|view| view.paused = true);
@@ -826,9 +989,14 @@ fn hooks_drive_the_teacher() {
         with_state(|teacher, _| {
             teacher.expect("the teacher").config.quiz_interval_seconds = 20.0;
         });
+        let blurred = io.session().blurred;
         let mut canvas = Canvas::sized([350.0, 405.0]);
         mod_api::dispatch_screen_render_post(&host, &mut canvas, &screen);
-        assert_eq!(io.session().blurred, 1, "the page blurs what is behind it");
+        assert_eq!(
+            io.session().blurred,
+            blurred + 1,
+            "the page blurs what is behind it"
+        );
         for (label, [x, y, w, h]) in &canvas.buttons {
             let on_screen = *x >= 0.0 && *y >= 0.0 && x + w <= 350.0 && y + h <= 405.0;
             assert!(on_screen, "{label} at {:?}", [x, y, w, h]);
@@ -970,6 +1138,212 @@ fn hooks_drive_the_teacher() {
         }
         super::detect::set_host_facts(None);
         assert_eq!(io.plays("fish"), 1);
+
+        // Every later world gets the hint 3 s in, not the guide.
+        assert_eq!(said_in_chat(&io, HINT), 2);
+
+        // V names the block under the crosshair at once, even while he is muted.
+        io.session().clicks.push(keys::MUTE);
+        tick(&mut host, &io, 50);
+        io.session().looked = Some(Aim::Block("minecraft:bloop".into()));
+        io.session().clicks.push(keys::WHAT_IS_THIS);
+        tick(&mut host, &io, 50);
+        assert_eq!(io.plays("word.bloop"), 1);
+        io.session().clicks.push(keys::MUTE);
+        tick(&mut host, &io, 50);
+
+        // An item's tooltip gets its German noun as the second line, in the original's gold (what
+        // the `item_tooltip` hook hands on with the stack's item id).
+        let mut lines = vec![
+            (Text::literal("Quux"), u32::MAX),
+            (Text::literal("minecraft:quux"), 0xFF55_5555),
+        ];
+        super::tooltip("minecraft:quux", &mut lines);
+        let second = lines
+            .get(1)
+            .map(|(text, _)| (plain(text), text.style.color.clone()));
+        let gold = Some("#FFE08A".to_string());
+        assert_eq!(second, Some(("das Quäx".to_string(), gold)), "{lines:?}");
+        assert_eq!(lines.len(), 3);
+
+        // The exam page, from the main page's link, fits the small window. Stop while the exam
+        // counts down turns `examAuto` off and says so; Start closes the screen and the questions
+        // begin at once, each with its header, the HUD naming the next between them.
+        io.session().clicks.push(keys::SETTINGS);
+        tick(&mut host, &io, 50);
+        let canvas = drawn(&host, SMALL, [0.0, 0.0]);
+        canvas.all_on_screen();
+        assert!(click_at(
+            &host,
+            canvas.button("learnordie.options.exam.on[20]")
+        ));
+        assert_eq!(settings_page(), Some(Page::Exam));
+        let canvas = drawn(&host, SMALL, [0.0, 0.0]);
+        canvas.all_on_screen();
+        assert!(click_at(&host, canvas.button("options.exam_typing")));
+        let [x, y, w, h] = canvas.button("learnordie.exam.stop[");
+        let hovered = drawn(&host, SMALL, [x + w / 2.0, y + h / 2.0]);
+        assert!(hovered.shows("learnordie.exam.start.tooltip[20]"));
+        assert!(click_at(&host, [x, y, w, h]));
+        let config = io
+            .file(Store::Config, files::CONFIG_FILE)
+            .expect("config written");
+        assert_eq!(config["examTyping"], Value::Bool(false));
+        assert_eq!(config["examAuto"], Value::Bool(false));
+        tick(&mut host, &io, 50);
+        assert_eq!(said_in_chat(&io, "[Teacher] learnordie.exam.stopped"), 1);
+        let canvas = drawn(&host, SMALL, [0.0, 0.0]);
+        assert!(click_at(&host, canvas.button("learnordie.exam.start")));
+        tick(&mut host, &io, 50);
+        assert!(!io.session().screen);
+        tick(&mut host, &io, 50);
+        let now = io.now();
+        let stage = with_state(|teacher, _| teacher.map(|t| t.exam(now)));
+        let Some(ExamStage::Asking { number: 1, total }) = stage else {
+            panic!("the exam asks at once: {stage:?}");
+        };
+        let begins = format!("[Teacher] learnordie.exam.begin[{total}]");
+        assert_eq!(said_in_chat(&io, &begins), 1);
+        let mut given = String::new();
+        for n in 1..=total {
+            next_question(&mut host, &io);
+            io.update(|view| view.paused = true);
+            tick(&mut host, &io, 800);
+            let canvas = drawn(&host, [480.0, 270.0], [0.0, 0.0]);
+            assert!(canvas.shows(&format!("learnordie.exam.header[{n}|{total}]")));
+            // The first answer is wrong: the result says what was picked.
+            let (_, right) = right_option();
+            let pick = if n == 1 { (right + 1) % 4 } else { right };
+            if n == 1 {
+                given = with_state(|teacher, _| {
+                    let open = teacher.and_then(|t| t.question().cloned());
+                    open.map(|open| open.options[pick].bare().to_string())
+                })
+                .expect("a question");
+            }
+            assert!(press(&host, &screen, &format!("key.keyboard.{}", pick + 1)));
+            tick(&mut host, &io, 50);
+            io.update(|view| view.paused = false);
+            tick(&mut host, &io, 100);
+            let mut canvas = Canvas::default();
+            mod_api::dispatch_gui_layer_draw(&host, LAYER, &mut canvas);
+            let next = format!("learnordie.exam.timer_asking[{}|{total}]", n + 1);
+            assert_eq!(canvas.shows(&next), n < total, "{:?}", canvas.texts);
+        }
+        // 2.5 s after the last answer: the score in chat, and the result screen, which pauses.
+        for _ in 0..30 {
+            tick(&mut host, &io, 100);
+        }
+        assert_eq!(pages(), [false, false, true], "the result shows");
+        let score = format!("{}|{total}", total - 1);
+        assert_eq!(
+            said_in_chat(&io, &format!("[Teacher] learnordie.exam.result[{score}]")),
+            1
+        );
+        tick(&mut host, &io, 50);
+        assert!(quiz_pauses());
+        let canvas = drawn(&host, SMALL, [0.0, 0.0]);
+        canvas.all_on_screen();
+        assert!(canvas.shows(&format!("learnordie.exam.result_title[{score}]")));
+        let rows = |mark: &str| canvas.texts.iter().filter(|t| t.starts_with(mark)).count();
+        assert_eq!((rows("\u{2713} "), rows("\u{2717} ")), (total - 1, 1));
+        assert!(canvas.shows(&format!("learnordie.exam.your_answer[{given}]")));
+        assert!(click_at(&host, canvas.button("gui.done")));
+        tick(&mut host, &io, 50);
+        assert!(!io.session().screen);
+        assert_eq!(pages(), [false; 3]);
+        let progress = io.file(Store::Data, &files::progress_file("de"));
+        let exams = progress.map(|p| p["worlds"]["save:Testwelt:0"]["exams"].clone());
+        let exam = exams.as_ref().and_then(|exams| exams.get(0));
+        let kept = exam.map(|e| (e["right"].clone(), e["total"].clone()));
+        assert_eq!(
+            kept,
+            Some((Value::from(total - 1), Value::from(total))),
+            "{exams:?}"
+        );
+
+        // J opens the dictionary on this world's learned phrases, the portrait hidden, every
+        // widget on screen in the small window. The other tab lists every world's; the search
+        // box finds one phrase, whose words, hints, notes and forms show; Play and Slow play it.
+        let learned = with_state(|teacher, _| {
+            let t = teacher.expect("the teacher");
+            let learned = t.dictionary.learned(&t.pack, &t.progress, &t.config);
+            let ids = |list: &[&Phrase]| list.iter().map(|p| (*p).clone()).collect::<Vec<_>>();
+            (ids(&learned.this_world), ids(&learned.all))
+        });
+        let (here, all) = learned;
+        assert!(
+            !here.is_empty() && all.len() >= here.len(),
+            "{here:?} {all:?}"
+        );
+        io.session().clicks.push(keys::DICTIONARY);
+        tick(&mut host, &io, 50);
+        assert_eq!(pages(), [false, true, false], "J opens the dictionary");
+        tick(&mut host, &io, 50);
+        assert!(quiz_pauses());
+        let mut hud = Canvas::default();
+        mod_api::dispatch_gui_layer_draw(&host, LAYER, &mut hud);
+        assert!(
+            hud.sprites.is_empty(),
+            "the portrait hides: {:?}",
+            hud.sprites
+        );
+        drawn(&host, SMALL, [0.0, 0.0]).all_on_screen();
+        // The rows' text is cut to fit: the list's content is read in a wide window.
+        const WIDE: [f32; 2] = [960.0, 540.0];
+        let canvas = drawn(&host, WIDE, [0.0, 0.0]);
+        let tabs = (
+            format!("learnordie.dict.tab.world[{}]", here.len()),
+            format!("learnordie.dict.tab.all[{}]", all.len()),
+        );
+        assert!(canvas.inactive.contains(&tabs.0), "this world's tab shows");
+        let listed = |canvas: &Canvas, list: &[Phrase]| list.iter().all(|p| canvas.shows(p.bare()));
+        assert!(listed(&canvas, &here));
+        assert!(click_at(&host, canvas.button(&tabs.1)));
+        let canvas = drawn(&host, WIDE, [0.0, 0.0]);
+        assert!(canvas.inactive.contains(&tabs.1) && listed(&canvas, &all));
+        let target = all
+            .iter()
+            .find(|p| !p.parts.is_empty())
+            .expect("a sentence");
+        assert!(click_at(&host, canvas.fields[0].1));
+        for c in target.en.to_lowercase().chars() {
+            assert!(type_char(&host, &screen, c));
+        }
+        drawn(&host, SMALL, [0.0, 0.0]).all_on_screen();
+        let canvas = drawn(&host, WIDE, [0.0, 0.0]);
+        let others = all.iter().filter(|p| p.text != target.text);
+        assert!(
+            others.clone().all(|p| !canvas.shows(p.bare())),
+            "the search finds one"
+        );
+        assert!(canvas.shows(target.bare()) && canvas.shows(&target.en));
+        assert!(target.parts.iter().all(|part| canvas.shows(&part.text)));
+        assert!(
+            canvas.shows("zhnarrator_de.dict.w.wer"),
+            "the first word's hint"
+        );
+        let note = canvas
+            .texts
+            .iter()
+            .any(|t| t.starts_with("zhnarrator_de.dict.note.fall["));
+        assert!(
+            note && canvas.shows("zhnarrator_de.dict.form.er"),
+            "{:?}",
+            canvas.texts
+        );
+        let played = |speed: &str| io.plays_at(speed, &target.id);
+        let before = (played("normal"), played("slow"));
+        assert!(click_at(&host, canvas.button("learnordie.dict.play")));
+        assert!(click_at(&host, canvas.button("learnordie.dict.slow")));
+        assert_eq!(
+            (played("normal"), played("slow")),
+            (before.0 + 1, before.1 + 1)
+        );
+        assert!(!press(&host, &screen, "key.keyboard.escape"));
+        io.session().screen = false;
+        tick(&mut host, &io, 50);
+        assert_eq!(pages(), [false; 3]);
 
         // The toggle key turns him off, says so in chat, and the config file keeps it.
         io.session().clicks.push(keys::TOGGLE);

@@ -19,9 +19,9 @@
 //! player's own projectiles come only from the integrated server ([`host_killed`], single
 //! player): off it, no projectile counts. In single player a sheep is named by its colour, also
 //! from the integrated server.
-use super::client::{Client, View};
+use super::client::{Aim, Client, View};
 use super::{STATE, State, lock};
-use crate::core::{Fate, Teacher, WorldTick};
+use crate::core::{Fate, Looked, Teacher, WorldTick};
 use mod_api::game::MobRender;
 use mod_api::{BlockClick, ClientHost, EntityRef, InteractionKey, ItemStack, KeyAction};
 use std::sync::Mutex;
@@ -396,6 +396,27 @@ pub(crate) fn entity_used(host: &dyn ClientHost, id: i32, kind: &str, stack: Opt
         && game.level.is_some()
     {
         teacher.entity_used(now, entity, &item, food);
+    }
+}
+
+/// The "what is this" key (Java `ActionDetector.sayLookedAt`): the word for the block or entity
+/// under the crosshair, said at once even while he is muted. A sheep is named by its colour in
+/// single player.
+pub(crate) fn what_is_this(
+    host: &dyn ClientHost,
+    io: &dyn Client,
+    teacher: &mut Teacher,
+    now: i64,
+) {
+    match io.crosshair(host) {
+        Some(Aim::Block(block)) => {
+            teacher.what_is_this(now, Looked::Block(&block));
+        }
+        Some(Aim::Entity { id, kind }) => {
+            let path = entity_path(id, &kind);
+            teacher.what_is_this(now, Looked::Entity(&path));
+        }
+        None => {}
     }
 }
 

@@ -1,6 +1,7 @@
 //! The game layer: the core's teacher wired to Horizon's client hooks. Detection, the voice, the
-//! HUD, the question screen, the keys, the files and the world key each have a module; this one
-//! keeps the state and runs the client tick.
+//! HUD, the question screen, the settings, the exam's result, the dictionary, the guide, the keys,
+//! the files and the world key each have a module; this one keeps the state and runs the client
+//! tick.
 //!
 //! State lives in one process-wide mutex. The two native mixins (`src/mixins/`) run inside game
 //! functions with no host, so what they share with the layer is kept in statics of its own: the
@@ -13,7 +14,10 @@
 //! ([`hosting`]); the other seats' games get nothing from the mod.
 pub mod client;
 pub(crate) mod detect;
+pub(crate) mod dictionary;
+pub(crate) mod exam;
 mod files;
+pub(crate) mod guide;
 pub mod hud;
 pub(crate) mod keys;
 pub(crate) mod loading;
@@ -27,7 +31,9 @@ mod tests;
 pub(crate) mod typing;
 pub(crate) mod world;
 
-use crate::core::{Outcome, Pictures, QuizEvent, Teacher, Verdict, Wipe};
+use crate::core::{
+    ExamResult, GuideCue, Outcome, Pictures, QuizEvent, Teacher, Verdict, Wipe, guide_cue,
+};
 use client::{Client, HostClient, View};
 use mod_api::{ClientHost, SoundRef, Text};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,9 +41,9 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 pub const MOD_ID: &str = "learnordie";
 
-/// True while this mod's screen asks to pause: the question screen with `quizPauseGame` on, or the
-/// settings pages (options screens pause); the `quiz_pause` mixin adds it to
-/// `Game::pauses_game`, which pauses single player only.
+/// True while this mod's screen asks to pause: the question screen with `quizPauseGame` on, or a
+/// settings page, the exam's result, the dictionary or the guide (the original's screens pause);
+/// the `quiz_pause` mixin adds it to `Game::pauses_game`, which pauses single player only.
 static QUIZ_PAUSES: AtomicBool = AtomicBool::new(false);
 /// Esc has just suspended the question: the `quiz_escape` mixin opens the pause menu once Escape
 /// has closed the screen, as the original's `onClose` does. Cleared every client tick.
@@ -149,10 +155,38 @@ pub(crate) struct Game {
     typing: Option<typing::Typing>,
     /// The settings page this mod's screen shows instead of a question.
     settings: Option<settings::Settings>,
+    /// The exam's result this mod's screen shows.
+    result: Option<exam::ResultScreen>,
+    /// An exam's result waiting for no other screen to be open.
+    pending_result: Option<ExamResult>,
+    /// The dictionary this mod's screen shows.
+    dictionary: Option<dictionary::DictionaryScreen>,
+    /// The dictionary shows the "all worlds" tab, kept across openings.
+    show_all: bool,
+    /// The guide this mod's screen shows.
+    guide: Option<guide::GuideScreen>,
+    /// Chat lines a screen hook left for the next client tick.
+    notices: Vec<Text>,
+    /// Client ticks with a player, paused or not, for the guide's first show (Java
+    /// `ticksInWorld`).
+    ticks_in_world: u32,
+    /// The translation language the pack was read with.
+    language: String,
     /// The world key of the world joined.
     world_key: Option<String>,
     /// The world the "no consequences" line was logged for.
     warned_world: Option<String>,
+}
+
+impl Game {
+    /// A screen of this mod's other than the question's shows: a settings page, the exam's
+    /// result, the dictionary or the guide.
+    pub(crate) fn panel_open(&self) -> bool {
+        self.settings.is_some()
+            || self.result.is_some()
+            || self.dictionary.is_some()
+            || self.guide.is_some()
+    }
 }
 
 pub(crate) struct State {
@@ -211,15 +245,26 @@ fn tick(host: &mut dyn ClientHost) {
         return;
     };
     let Some(mut view) = io.view(&*host) else {
+        game.ticks_in_world = 0;
         leave(&*host, io, teacher, game, now);
         QUIZ_PAUSES.store(false, Ordering::Relaxed);
         return;
     };
     detect::merge_events(&mut view, now);
-    settings::tick(host, io, game, &view);
-    keys::handle(host, io, teacher, game, now);
-    if game.settings.is_some() {
-        // The settings page is up: a screen is open, and it is not the question's.
+    panels_tick(host, io, game, &view);
+    guide_tick(host, io, teacher, game, &view);
+    keys::handle(host, io, teacher, game, &view, now);
+    if let Some(dictionary) = game.dictionary.as_mut() {
+        dictionary.tick();
+    }
+    if !view.screen_open
+        && !game.panel_open()
+        && let Some(result) = game.pending_result.take()
+    {
+        open_result(host, io, game, result);
+    }
+    if game.panel_open() {
+        // A page of this mod's is up: a screen is open, and it is not the question's.
         view.screen_open = true;
         view.our_screen = false;
     }
@@ -244,13 +289,111 @@ fn tick(host: &mut dyn ClientHost) {
         files::save_progress(&*host, io, &mut teacher.progress, language, now);
     }
     finish_answers(host, io, teacher, game, view.our_screen);
+    for line in std::mem::take(&mut game.notices) {
+        io.chat(host, line);
+    }
     if !question_up(teacher) {
         game.typing = None;
     }
     let up = question_up(teacher) && (view.our_screen || opened);
-    let pauses = (up && teacher.config.quiz_pause_game) || game.settings.is_some();
+    let pauses = (up && teacher.config.quiz_pause_game) || game.panel_open();
     QUIZ_PAUSES.store(pauses, Ordering::Relaxed);
 }
+
+/// This mod's pages: all forgotten once its screen is closed (Escape, or another screen over
+/// it), and closed when one asked to (Done, the exam's Start, the guide's last page). A guide
+/// shown on its own leaves the chat hint as it goes; the dictionary stops its sound.
+fn panels_tick(host: &mut dyn ClientHost, io: &dyn Client, game: &mut Game, view: &View) {
+    let closing = game
+        .settings
+        .as_ref()
+        .is_some_and(settings::Settings::closing)
+        || game.result.as_ref().is_some_and(|page| page.close)
+        || game.guide.as_ref().is_some_and(|page| page.close);
+    if view.our_screen && !closing {
+        return;
+    }
+    if view.our_screen && game.panel_open() {
+        io.close_screen(host);
+    }
+    game.settings = None;
+    game.result = None;
+    if let Some(mut page) = game.dictionary.take() {
+        page.stop(&*host, io);
+    }
+    if let Some(page) = game.guide.take()
+        && page.first_show
+    {
+        game.notices.extend(guide::hint(&*host, io));
+    }
+}
+
+/// `ZhNarratorClient.tick`'s first-run guide: 3 s into the first world it opens, once ever
+/// (`guideShown` is saved at once); every other world gets the chat hint then.
+fn guide_tick(
+    host: &mut dyn ClientHost,
+    io: &dyn Client,
+    teacher: &mut Teacher,
+    game: &mut Game,
+    view: &View,
+) {
+    game.ticks_in_world = game.ticks_in_world.saturating_add(1);
+    match guide_cue(game.ticks_in_world, view.screen_open, &mut teacher.config) {
+        Some(GuideCue::Open) => {
+            files::save_config(&*host, io, &teacher.config);
+            if io.open_screen(host) {
+                game.guide = Some(guide::GuideScreen::new(false, true));
+            }
+        }
+        Some(GuideCue::Hint) => game.notices.extend(guide::hint(&*host, io)),
+        None => {}
+    }
+}
+
+/// `§e`, the yellow of the teacher's notices.
+pub(crate) const YELLOW: u32 = 0xFF_FF55;
+
+/// `[Teacher] <key>` in yellow (the original's `Component.literal("[Teacher] ")` notices).
+pub(crate) fn teacher_says(key: &str, arguments: Vec<Text>) -> Text {
+    let mut line = Text::literal("[Teacher] ").append(Text::translate(key, arguments));
+    line.style.color = Some(format!("#{YELLOW:06X}"));
+    line
+}
+
+/// A number as a lang argument.
+pub(crate) fn number(n: usize) -> Text {
+    Text::literal(n.to_string())
+}
+
+/// The exam's result screen (`ExamResultScreen`, which pauses the game), or once no screen is
+/// open when one is.
+fn open_result(host: &mut dyn ClientHost, io: &dyn Client, game: &mut Game, result: ExamResult) {
+    if io.open_screen(host) {
+        game.result = Some(exam::ResultScreen::new(result));
+    } else {
+        game.pending_result = Some(result);
+    }
+}
+
+/// The item tooltip's hook (Java `ZhNarratorClient.appendTooltip`): the item's German noun as the
+/// second line, in the original's gold.
+pub(crate) fn tooltip(item: &str, lines: &mut Vec<(Text, u32)>) {
+    let state = lock(&STATE);
+    let Some(teacher) = state.teacher.as_ref() else {
+        return;
+    };
+    if lines.is_empty() {
+        return;
+    }
+    if let Some(noun) = teacher.tooltip_line(item) {
+        lines.insert(1, (screen::coloured(noun, TOOLTIP), TOOLTIP_RGBA));
+    }
+}
+
+/// The tooltip line's colour, `0xFFE08A`, and as a tooltip line's colour packs it (the engine's
+/// `rgba`: alpha, blue, green, red from the top byte down).
+const TOOLTIP: u32 = 0xFF_E08A;
+const TOOLTIP_RGBA: u32 = 0xFF8A_E0FF;
 
 /// The client is about to disconnect: the progress is saved.
 pub(crate) fn logging_out(host: &mut dyn ClientHost) {
@@ -280,12 +423,13 @@ fn reload(
     }
     game.loaded = Some(generation);
     match loading::load(host, io, teacher.as_mut(), now) {
-        Ok((fresh, pictures)) => {
+        Ok(loaded) => {
             if let Some(sound) = game.sound.take() {
                 io.stop(host, sound);
             }
-            *teacher = Some(fresh);
-            game.pictures = pictures;
+            *teacher = Some(loaded.teacher);
+            game.pictures = loaded.pictures;
+            game.language = loaded.language;
             game.level = None;
             game.target = None;
             game.attacked.clear();
@@ -314,6 +458,12 @@ fn leave(host: &dyn ClientHost, io: &dyn Client, teacher: &mut Teacher, game: &m
     game.picture = None;
     game.typing = None;
     game.settings = None;
+    game.result = None;
+    game.pending_result = None;
+    if let Some(mut page) = game.dictionary.take() {
+        page.stop(host, io);
+    }
+    game.guide = None;
     game.world_key = None;
     detect::set_hardcore(false);
 }
@@ -375,14 +525,26 @@ fn world_tick(
             open_question(host, io, teacher, game)
         }
         Some(QuizEvent::Resume) => open_question(host, io, teacher, game),
-        // The exam's chat lines and result screen come with the exam's client lane.
-        Some(
-            QuizEvent::Dropped
-            | QuizEvent::ExamBegins { .. }
-            | QuizEvent::ExamEmpty
-            | QuizEvent::ExamOver(_),
-        )
-        | None => false,
+        Some(QuizEvent::ExamBegins { questions }) => {
+            log_info(format!("exam: {questions} questions"));
+            let line = teacher_says("learnordie.exam.begin", vec![number(questions)]);
+            io.chat(host, line);
+            false
+        }
+        Some(QuizEvent::ExamEmpty) => {
+            log_info("exam: nothing was said or asked, no questions".into());
+            io.chat(host, teacher_says("learnordie.exam.nothing", vec![]));
+            false
+        }
+        Some(QuizEvent::ExamOver(result)) => {
+            let (right, total) = (result.right(), result.total());
+            log_info(format!("exam over: {right} of {total} right"));
+            let score = vec![number(right), number(total)];
+            io.chat(host, teacher_says("learnordie.exam.result", score));
+            open_result(host, io, game, result);
+            false
+        }
+        Some(QuizEvent::Dropped) | None => false,
     }
 }
 

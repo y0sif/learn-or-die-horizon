@@ -14,11 +14,12 @@ use mod_api::{
     ClientPlayerLoggingOutEvent, ClientTickPostEvent, EntityInteractEvent,
     ExtractBlockScreenEffectEvent, Flow, GuiDraw, GuiLayerDrawEvent, Hand, HealthHudEvent, Hooks,
     HostSide, InputKeyEvent, InteractionKeyMappingTriggeredEvent, InteractionResult,
-    KeyMappingPreEvent, LivingDeathEvent, LogicalSide, PlayerTickPostEvent, RegisterGuiLayersEvent,
-    Registrar, RegistrationContext, RenderLivingPreEvent, RightClickBlockEvent,
-    ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent,
-    ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreEvent, ScreenRenderPostEvent,
-    ServerHost, ServerStartedEvent, ServerStoppedEvent,
+    ItemTooltipEvent, KeyMappingPreEvent, LivingDeathEvent, LogicalSide, PlayerTickPostEvent,
+    RegisterGuiLayersEvent, Registrar, RegistrationContext, RenderLivingPreEvent,
+    RightClickBlockEvent, ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent,
+    ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
+    ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent, ServerHost,
+    ServerStartedEvent, ServerStoppedEvent,
 };
 
 pub mod core;
@@ -217,6 +218,13 @@ impl Hooks for Mod {
         None
     }
 
+    /// An item's tooltip: its German noun with the article as the second line.
+    fn item_tooltip(&self, host: &dyn ClientHost, event: &mut ItemTooltipEvent<'_>) {
+        if game::hosting() {
+            game::tooltip(&event.stack.item().id(host), event.lines);
+        }
+    }
+
     fn gui_layer_draw(&self, host: &dyn ClientHost, event: &mut GuiLayerDrawEvent<'_>) {
         if game::hosting() {
             game::hud::draw(host, event);
@@ -282,5 +290,16 @@ impl Hooks for Mod {
             return Flow::Continue;
         }
         game::screen::mouse_dragged(host, event)
+    }
+
+    fn screen_mouse_scrolled_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenMouseScrolledPreEvent<'_>,
+    ) -> Flow {
+        if !game::hosting() {
+            return Flow::Continue;
+        }
+        game::screen::mouse_scrolled(host, event)
     }
 }

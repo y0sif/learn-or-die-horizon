@@ -1,22 +1,28 @@
 //! The settings pages (Java `NarratorSettingsScreen`, `NarratorAdvancedScreen`,
-//! `NarratorTopicsScreen`), on this mod's screen: I opens the main page, whose last button leads
-//! to the advanced page, whose last leads to the topics.
+//! `NarratorTopicsScreen`, `ExamScreen`), on this mod's screen: I opens the main page, whose last
+//! buttons lead to the exam page, the advanced page (whose last leads to the topics) and the
+//! guide.
 //!
 //! The rows are the core's ([`crate::core::settings`]), laid out as the original's options list:
 //! two columns of `Label: Value` buttons, a row the original gives the whole width on a line of
-//! its own, the page button under them and Done in the footer. A click on a switch or a choice
+//! its own, the page buttons under them and Done in the footer. A click on a switch or a choice
 //! moves it on (Shift moves it back); a slider takes the value under the pointer and follows a
 //! drag, and the arrow keys move a focused slider a step. Every change is saved to
 //! `config/learnordie.json` at once and the teacher reads it from there on; a new translation
 //! language loads the pack again, as the original reloads its resources.
 //!
+//! The exam page ends with Start, which saves the config, starts an exam whose questions begin at
+//! once and closes the screen, or Stop while one runs, which drops it, turns `examAuto` off and
+//! says so in chat. Not in a world, the button is off.
+//!
 //! Esc or Done goes back a page; on the main page it closes the screen. Like an options screen,
 //! a page pauses single player and blurs the world and the HUD behind it.
-use super::client::{Client, View, WidgetHost};
+use super::client::{Client, WidgetHost};
+use super::guide::GuideScreen;
 use super::screen::inside;
-use super::{Game, files, keys};
+use super::{Game, files, keys, log_info, number, teacher_says};
 pub(crate) use crate::core::Page;
-use crate::core::{Config, Pack, Setting, Shown, Teacher, settings as rows};
+use crate::core::{Config, ExamStage, Pack, Setting, Shown, Teacher, exam_link, settings as rows};
 use mod_api::client::widgets::{Button, Outcome as Input, WidgetId, Widgets};
 use mod_api::{ClientHost, DrawContext, Flow, Text};
 
@@ -47,14 +53,34 @@ fn is_wide(name: &str) -> bool {
     matches!(name, "enabled" | "hint_language" | "english" | "backdrop")
 }
 
-/// The page a page's last button leads to, and the one Esc and Done go back to.
-fn next(page: Page) -> Option<Page> {
+/// What a button under a page's rows does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    /// Opens that page.
+    Page(Page),
+    /// Opens the guide; closing it comes back to the main page.
+    Guide,
+    /// The exam page's Start or Stop.
+    Exam,
+}
+
+/// The buttons under a page's rows, each on a line of its own: the main page's exam page,
+/// advanced page and guide, the advanced page's topics, the exam page's Start or Stop.
+fn links(page: Page) -> Vec<Link> {
     match page {
-        Page::Main => Some(Page::Advanced),
-        Page::Advanced => Some(Page::Topics),
-        Page::Topics | Page::Exam => None,
+        Page::Main => vec![
+            Link::Page(Page::Exam),
+            Link::Page(Page::Advanced),
+            Link::Guide,
+        ],
+        Page::Advanced => vec![Link::Page(Page::Topics)],
+        Page::Topics => Vec::new(),
+        Page::Exam => vec![Link::Exam],
     }
 }
+
+/// How many questions an exam asks at most, for the Start button's tooltip.
+const EXAM_QUESTIONS: usize = 20;
 
 fn parent(page: Page) -> Option<Page> {
     match page {
@@ -139,9 +165,10 @@ pub(crate) struct Settings {
     page: Page,
     rows: Vec<Setting>,
     widgets: Widgets,
-    /// Each row's button, in the rows' order, then the page button and Done.
+    /// Each row's button, in the rows' order.
     buttons: Vec<WidgetId>,
-    link: Option<(WidgetId, Page)>,
+    /// The buttons under the rows.
+    links: Vec<(WidgetId, Link)>,
     done: WidgetId,
     /// Each button's place when last drawn.
     rects: Vec<[f32; 4]>,
@@ -157,21 +184,17 @@ impl Settings {
         let mut widgets = Widgets::new();
         let blank = || Button::new([0.0; 4], Text::literal(""));
         let buttons = rows.iter().map(|_| widgets.add_button(blank())).collect();
-        let link = next(page).map(|to| {
-            let key = match to {
-                Page::Topics => "learnordie.options.topics",
-                _ => "learnordie.options.advanced",
-            };
-            let label = Text::translate(key, vec![]);
-            (widgets.add_button(Button::new([0.0; 4], label)), to)
-        });
+        let links = links(page)
+            .into_iter()
+            .map(|link| (widgets.add_button(blank()), link))
+            .collect();
         let done = widgets.add_button(Button::new([0.0; 4], Text::translate("gui.done", vec![])));
         Settings {
             page,
             rows,
             widgets,
             buttons,
-            link,
+            links,
             done,
             rects: Vec::new(),
             dragging: None,
@@ -184,10 +207,17 @@ impl Settings {
         self.page
     }
 
-    /// The buttons where they go in a screen of `size`, each label showing its value.
-    fn place(&mut self, [w, h]: [f32; 2], config: &Config) {
+    /// Done or Esc on the main page, or the exam's Start: the next client tick closes the screen.
+    pub(crate) fn closing(&self) -> bool {
+        self.close
+    }
+
+    /// The buttons where they go in a screen of `size`, each label showing its value; the exam's
+    /// Start or Stop as the exam stands, off outside a world.
+    fn place(&mut self, [w, h]: [f32; 2], teacher: &Teacher, now: i64, in_world: bool) {
+        let config = &teacher.config;
         let lines = lines(&self.rows);
-        let count = lines.len() + usize::from(self.link.is_some());
+        let count = lines.len() + self.links.len();
         let small = SMALL_W.min(((w - SIDE * 2.0 - GAP) / 2.0).floor()).max(1.0);
         let wide = small * 2.0 + GAP;
         let left = (w / 2.0).floor() - small - GAP / 2.0;
@@ -213,11 +243,15 @@ impl Settings {
                 button.label = text;
             }
         }
-        if let Some((id, _)) = self.link
-            && let Some(button) = self.widgets.button_mut(id)
-        {
-            button.rect = [left, TOP + lines.len() as f32 * pitch, wide, BUTTON_H];
-            rects.push(button.rect);
+        for (index, &(id, link)) in self.links.iter().enumerate() {
+            let (label, active) = link_label(link, teacher, now, in_world);
+            if let Some(button) = self.widgets.button_mut(id) {
+                let line = (lines.len() + index) as f32;
+                button.rect = [left, TOP + line * pitch, wide, BUTTON_H];
+                button.label = label;
+                button.active = active;
+                rects.push(button.rect);
+            }
         }
         let done_w = DONE_W.min(w - SIDE * 2.0);
         if let Some(button) = self.widgets.button_mut(self.done) {
@@ -244,13 +278,55 @@ impl Settings {
     }
 }
 
-/// From the client tick: a page closed by Esc is forgotten, and one Done or Esc left is closed.
-pub(crate) fn tick(host: &mut dyn ClientHost, io: &dyn Client, game: &mut Game, view: &View) {
-    if !view.our_screen {
-        game.settings = None;
-    } else if game.settings.as_ref().is_some_and(|page| page.close) {
-        io.close_screen(host);
-        game.settings = None;
+/// A link's label, and whether it can be pressed: the exam page's as the exam stands
+/// (`ExamScreen.addOptions`), off outside a world.
+fn link_label(link: Link, teacher: &Teacher, now: i64, in_world: bool) -> (Text, bool) {
+    let key = |key: &str| Text::translate(key, vec![]);
+    match link {
+        Link::Page(Page::Exam) => match exam_link(&teacher.config) {
+            Some(minutes) => (
+                Text::translate("learnordie.options.exam.on", vec![Text::literal(minutes)]),
+                true,
+            ),
+            None => (key("learnordie.options.exam.off"), true),
+        },
+        Link::Page(Page::Topics) => (key("learnordie.options.topics"), true),
+        Link::Page(_) => (key("learnordie.options.advanced"), true),
+        Link::Guide => (key("learnordie.options.guide"), true),
+        Link::Exam if !in_world => (key("learnordie.exam.need_world"), false),
+        Link::Exam => match teacher.exam(now) {
+            ExamStage::Off => (key("learnordie.exam.start"), true),
+            ExamStage::Playing { left } => (
+                Text::translate("learnordie.exam.stop", vec![Text::literal(left)]),
+                true,
+            ),
+            ExamStage::Asking { .. } => (key("learnordie.exam.stop_asking"), true),
+        },
+    }
+}
+
+/// The exam page's Start or Stop (`ExamScreen`'s button): Start saves the config, starts an
+/// exam whose questions begin at once and closes the screen; Stop drops the running exam, turns
+/// `examAuto` off, saves it, says so in chat and shows the page again.
+fn exam_button(host: &dyn ClientHost, io: &dyn Client, teacher: &mut Teacher, game: &mut Game) {
+    if game.level.is_none() {
+        return;
+    }
+    let now = io.now();
+    if teacher.exam(now) == ExamStage::Off {
+        files::save_config(host, io, &teacher.config);
+        teacher.start_exam(now);
+        log_info("exam started by the player".into());
+        if let Some(page) = game.settings.as_mut() {
+            page.close = true;
+        }
+    } else {
+        teacher.stop_exam();
+        files::save_config(host, io, &teacher.config);
+        log_info("exam stopped by the player".into());
+        game.notices
+            .push(teacher_says("learnordie.exam.stopped", vec![]));
+        game.settings = Some(Settings::new(Page::Exam, &teacher.pack));
     }
 }
 
@@ -327,10 +403,22 @@ pub(super) fn render(
     let title = io.tr(host, &Text::translate(title(page.page), vec![]));
     let title_w = draw.text_width(&title);
     draw.text(&title, [((w - title_w) / 2.0).floor(), 13.0], WHITE, true);
-    page.place(size, &teacher.config);
+    page.place(size, teacher, io.now(), game.level.is_some());
     let widgets_host = WidgetHost { io, host };
     if let Err(e) = page.widgets.draw(draw, &widgets_host, mouse) {
         super::log_warn(format!("could not draw the settings: {e:?}"));
+    }
+    let start = page.links.iter().find(|(_, link)| *link == Link::Exam);
+    if let Some(button) = start.and_then(|(id, _)| page.widgets.button(*id))
+        && inside(mouse, button.rect)
+    {
+        let tip = Text::translate(
+            "learnordie.exam.start.tooltip",
+            vec![number(EXAM_QUESTIONS)],
+        );
+        if let Err(e) = draw.gui_tooltip(&[tip], mouse) {
+            super::log_warn(format!("could not draw the exam's tooltip: {e:?}"));
+        }
     }
     let focused = page.widgets.focused();
     for (index, row) in page.rows.iter().enumerate() {
@@ -438,8 +526,9 @@ pub(super) fn mouse_pressed(
 }
 
 /// A button pressed: a switch or a choice moves on (back with Shift), a slider clicked takes the
-/// value under the pointer and holds the drag (Enter on a slider does nothing), the page button
-/// opens its page and Done goes back.
+/// value under the pointer and holds the drag (Enter on a slider does nothing), a page button
+/// opens its page, the guide's opens the guide, the exam's starts or stops it, and Done goes
+/// back.
 fn press(
     host: &dyn ClientHost,
     io: &dyn Client,
@@ -456,10 +545,15 @@ fn press(
         back(teacher, game);
         return;
     }
-    if let Some((link, to)) = page.link
-        && id == link
-    {
-        *page = Settings::new(to, &teacher.pack);
+    if let Some(&(_, link)) = page.links.iter().find(|(link, _)| *link == id) {
+        match link {
+            Link::Page(to) => *page = Settings::new(to, &teacher.pack),
+            Link::Guide => {
+                game.settings = None;
+                game.guide = Some(GuideScreen::new(true, false));
+            }
+            Link::Exam => exam_button(host, io, teacher, game),
+        }
         return;
     }
     let Some(index) = page.row_of(id) else {
