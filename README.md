@@ -26,7 +26,8 @@ The port has the core of Learn or Die with the German pack:
   normal or slow. Item tooltips show the German noun, and "what is this" names the block or mob you look at.
 - Your answers are saved per world. A phrase you know is not asked or said again in that world.
 
-A short guide opens in your first world. Voice answers are not ported.
+A short guide opens in your first world. Not ported: voice answers, and the HUD's score counter, learned-phrase
+banner and jingle.
 
 ## Keys
 
@@ -61,8 +62,7 @@ German pack, the voices and the portrait from that jar. It contains none of them
 
 Press I in a world to change the settings: question type and frequency, penalties and rewards, the angry
 teacher, the exam, speech speed and volume, tooltips, and which actions the teacher talks about. They are saved
-at once to
-`config/learnordie.json` in the instance folder, with the original's setting names and defaults.
+at once to `config/learnordie.json` in the instance folder, with the original's setting names and defaults.
 
 ## License
 
