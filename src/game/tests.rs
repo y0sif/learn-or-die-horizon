@@ -299,9 +299,6 @@ impl Client for TestClient {
     fn entity_fates(&self, _: &dyn ClientHost, _: &[u64]) -> Vec<(u64, Fate)> {
         Vec::new()
     }
-    fn projectile_hits(&self, _: &dyn ClientHost) -> Vec<(u64, String)> {
-        Vec::new()
-    }
 }
 
 /// Records what the HUD and the screen draw.

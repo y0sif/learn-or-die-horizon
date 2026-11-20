@@ -98,8 +98,9 @@ pub struct WorldTick<'a> {
     /// The biome's base temperature.
     pub biome_temperature: f32,
     /// Living entities, not the player, hurt this very tick (`hurtTime == hurtDuration > 0`)
-    /// within 3 blocks of one of the player's projectiles: `(entity, entity id)`. Only needed
-    /// while `sayKills` is on.
+    /// within 3 blocks of one of the player's projectiles: `(entity, entity id)`, watched as a
+    /// melee hit is. Only needed while `sayKills` is on. The game layer gives the kills the
+    /// integrated server credits to the player, dying in `entity_fates` too.
     pub projectile_hits: &'a [(u64, &'a str)],
     /// Of [`Teacher::watched_entities`], those dying now or gone. One not listed is alive.
     pub entity_fates: &'a [(u64, Fate)],

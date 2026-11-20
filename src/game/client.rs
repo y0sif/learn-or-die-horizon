@@ -30,6 +30,8 @@ pub enum Store {
 pub struct View {
     /// The client level, as a hash of its handle: a new value is a new level object.
     pub level: u64,
+    /// The local player's UUID, by which the integrated server's half knows its host.
+    pub uuid: u128,
     pub dimension: String,
     /// This window owns the integrated server it plays on (open to LAN or not).
     pub singleplayer: bool,
@@ -199,9 +201,6 @@ pub trait Client: Send + Sync {
     fn used_item(&self, host: &dyn ClientHost, stack: Option<&ItemStack>) -> (String, bool);
     /// Of the entities `watched` (network ids), those dying now or gone.
     fn entity_fates(&self, host: &dyn ClientHost, watched: &[u64]) -> Vec<(u64, Fate)>;
-    /// Living entities, not the player, hurt this tick within 3 blocks of a projectile a player
-    /// throws or shoots: `(network id, entity type id)`.
-    fn projectile_hits(&self, host: &dyn ClientHost) -> Vec<(u64, String)>;
 }
 
 /// The host the SDK's widgets run with: their clock, the clipboard and the button click go
@@ -259,27 +258,6 @@ fn is_living(kind: &str) -> bool {
         ))
 }
 
-/// The projectiles a player throws or shoots (Java's `Projectile` with the player as owner; a
-/// client cannot read the owner).
-fn is_players_projectile(kind: &str) -> bool {
-    matches!(
-        kind.rsplit(':').next().unwrap_or(kind),
-        "arrow"
-            | "spectral_arrow"
-            | "trident"
-            | "snowball"
-            | "egg"
-            | "ender_pearl"
-            | "potion"
-            | "splash_potion"
-            | "lingering_potion"
-            | "experience_bottle"
-            | "wind_charge"
-            | "firework_rocket"
-            | "fishing_bobber"
-    )
-}
-
 /// The sea level the snow line is reckoned from: a client cannot read it, and only the overworld,
 /// where it is 63, has biomes with precipitation.
 const SEA_LEVEL: i32 = 63;
@@ -321,10 +299,6 @@ fn in_fire(host: &dyn ClientHost, level: LevelRef, [x, y, z]: [i32; 3]) -> bool 
             )
         })
     })
-}
-
-fn distance_sq(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a.iter().zip(b).map(|(p, q)| (p - q) * (p - q)).sum()
 }
 
 /// [`Client`] answered by the game.
@@ -434,6 +408,7 @@ impl Client for HostClient {
             .and_then(|biome| level.biome_properties(host, &biome));
         Some(View {
             level: hasher.finish(),
+            uuid: player.uuid(),
             dimension: player
                 .dimension(host)
                 .map_or_else(|| host.dimension().to_string(), |d| d.to_string()),
@@ -671,37 +646,5 @@ impl Client for HostClient {
                 }
             })
             .collect()
-    }
-
-    fn projectile_hits(&self, host: &dyn ClientHost) -> Vec<(u64, String)> {
-        let hurt = detect::seen_hurt();
-        let Some(player) = host.local_player().filter(|_| !hurt.is_empty()) else {
-            return Vec::new();
-        };
-        let (own, Some(level)) = (player.entity().id(), player.level(host)) else {
-            return Vec::new();
-        };
-        let mut hits = Vec::new();
-        for (id, kind) in hurt {
-            let at = host.entity(id).and_then(|entity| entity.position(host));
-            let Some(at) = at.filter(|_| id != own) else {
-                continue;
-            };
-            let near = level
-                .entities_in(host, at.map(|c| c - 3.5), at.map(|c| c + 3.5))
-                .unwrap_or_default();
-            let shot = near.into_iter().any(|entity| {
-                entity
-                    .kind(host)
-                    .is_some_and(|key| is_players_projectile(&key.id(host)))
-                    && entity
-                        .position(host)
-                        .is_some_and(|p| distance_sq(p, at) < 9.0)
-            });
-            if shot {
-                hits.push((u64::from(id), kind));
-            }
-        }
-        hits
     }
 }

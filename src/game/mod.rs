@@ -361,10 +361,13 @@ fn world_tick(
             .collect()
     });
     let breaking = detect::mining(game.target.as_ref());
-    let fates = detect::fates(&*host, io, teacher);
-    let hits = detect::hits(&*host, io, teacher);
-    let hits: Vec<(u64, &str)> = hits.iter().map(|(id, kind)| (*id, kind.as_str())).collect();
-    let input = detect::world_tick(view, inventory.as_deref(), breaking, &hits, &fates, now);
+    let credited = detect::credited_kills(view);
+    let fates = detect::fates(&*host, io, teacher, &credited);
+    let kills: Vec<(u64, &str)> = credited
+        .iter()
+        .map(|(id, kind)| (*id, kind.as_str()))
+        .collect();
+    let input = detect::world_tick(view, inventory.as_deref(), breaking, &kills, &fates, now);
     let event = teacher.world_tick(&input);
     match event {
         Some(QuizEvent::Ask) => {

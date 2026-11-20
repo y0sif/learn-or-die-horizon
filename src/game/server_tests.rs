@@ -1,31 +1,49 @@
 //! The server half: each row sends one answer's consequences through the payload's codec to its
 //! handler and checks what reached the player and the level.
 //!
-//! The host is the SDK's fake host (the player, their name, level and inventory slots, the blocks
-//! and the command log) in a double that adds what the fake does not model: the player's max
-//! health, health and position, the blocks' collision shapes, the server's entity types and the
-//! stacks thrown. Where the game would act on a command (effects, kills, summons) or on the
-//! attribute map, the row checks what the mod asked the host to do.
+//! The host is the SDK's fake host (the player, their name, level and inventory slots, the blocks,
+//! the entities' kinds and the command log) in a double that adds what the fake does not model:
+//! the player's max health, health, position, eyes, hands, vehicle and fire, the blocks'
+//! collision shapes, the server's entity types, the entities around, a sheep's colour, a fishing
+//! hook's owner, and the item entities thrown or spawned. Where the game would act on a command
+//! (effects, kills, summons) or on the attribute map, the row checks what the mod asked the host
+//! to do.
+use super::super::detect::HostFacts;
 use super::super::payload::{Action, Consequences};
-use super::{HOST_PLAYER, receive};
+use super::{HOST_PLAYER, kill_credit, receive, ticked};
 use crate::core::{Effect, ServerAction, Wipe};
 use mod_api::__private::game::{BackendMutRefOf, BackendRefOf};
 use mod_api::prelude::*;
 use mod_api::testing::FakeHost;
 use mod_api::{
     AttributeModifier, AttributeOperation, Backend, BackendMut, BackendMutRef, BackendRef,
-    BlockShapeKind, BlockState, Commands, EntityRef, EntityTypeKey, Host, Identifier, ItemStack,
-    LevelRef, LivingRef, ModifierLifetime, PAYLOAD_DECODE_BUDGET, PlayerDataRefusal, PlayerRef,
-    ServerHost, StackWriteError, decode_payload, encode_payload,
+    BlockShapeKind, BlockState, Commands, Compound, EntityRef, EntityTypeKey, FishingHookRef, Hand,
+    Host, Identifier, ItemKey, ItemStack, LevelRef, LivingRef, ModifierLifetime,
+    PAYLOAD_DECODE_BUDGET, PlayerDataRefusal, PlayerRef, ServerHost, StackWriteError, Tag,
+    decode_payload, encode_payload,
 };
 use std::collections::BTreeMap;
 
 const PLAYER: u128 = 7;
 const GUEST: u128 = 8;
 const ENTITY: u32 = 10;
+/// The guest's entity, online beside the host.
+const GUEST_ENTITY: u32 = 11;
 /// The player stands on stone at y 64, far from the world's spawn.
 const BLOCK: [i32; 3] = [100, 65, -41];
 const POSITION: [f64; 3] = [100.3, 65.0, -40.7];
+const EYES: [f64; 3] = [100.3, 66.62, -40.7];
+/// Around the player: a red sheep, a fishing hook, a skeleton.
+const SHEEP: u32 = 200;
+const HOOK: u32 = 201;
+const SKELETON: u32 = 202;
+const AROUND: [(u32, &str); 3] = [
+    (SHEEP, "minecraft:sheep"),
+    (HOOK, "minecraft:fishing_bobber"),
+    (SKELETON, "minecraft:skeleton"),
+];
+/// `DyeColor.RED`'s id.
+const RED: i8 = 14;
 /// The server's entity types (and the player's). The friendly ones are friendly by category alone.
 const TYPES: [&str; 6] = [
     "minecraft:zombie",
@@ -44,6 +62,26 @@ const STACKS: [(i32, &str, u32); 4] = [
     (-106, "minecraft:shield", 1),
 ];
 
+/// The host's player as they tick after the payload.
+#[derive(Clone, Copy, Default)]
+struct Tick {
+    riding: bool,
+    fire_ticks: i32,
+    /// A fishing rod in the main hand.
+    rod: bool,
+    /// Whose the fishing hook around is: none's by default.
+    hook_owner: Option<u32>,
+}
+
+/// An item entity in the level: thrown by `living.drop` with `throw_randomly` and
+/// `include_thrower_name`, or spawned at a spot with a motion and a pickup delay.
+#[derive(Clone)]
+struct Item {
+    stack: ItemStack,
+    thrown: Option<(bool, bool)>,
+    spawned: Option<([f64; 3], [f64; 3], u32)>,
+}
+
 /// The fake host and what the double adds to it.
 #[derive(Clone)]
 struct Server {
@@ -52,16 +90,27 @@ struct Server {
     /// The player's max-health modifiers and their lifetimes (base 20).
     modifiers: Vec<(AttributeModifier, ModifierLifetime)>,
     health: f32,
-    /// The stacks thrown, with `throw_randomly` and `include_thrower_name`.
-    thrown: Vec<(ItemStack, bool, bool)>,
+    tick: Tick,
+    rod: ItemStack,
+    /// `living.drop` throws nothing, and neither does a spawned item.
+    drop_refused: bool,
+    spawn_refused: bool,
+    items: Vec<Item>,
 }
 
 impl Server {
+    /// Within the attribute's range (`RangedAttribute`, 1 to 1024), as the game's value.
     fn max_health(&self) -> f64 {
-        20.0 + self.modifiers.iter().map(|(m, _)| m.amount).sum::<f64>()
+        (20.0 + self.modifiers.iter().map(|(m, _)| m.amount).sum::<f64>()).clamp(1.0, 1024.0)
     }
     fn is_player(&self, entity: EntityRef) -> bool {
         entity.id() == ENTITY
+    }
+    /// A new item entity's handle.
+    fn item(&mut self, item: Item) -> EntityRef {
+        self.items.push(item);
+        let player = self.fake.entity(ENTITY).expect("the player");
+        EntityRef::new(player.epoch(), 1000 + self.items.len() as u32)
     }
 }
 
@@ -87,14 +136,37 @@ impl ServerHost for Server {
 }
 impl Backend for Server {}
 impl BackendMut for Server {}
-mod_api::impl_host_areas!(Server, except(keys, living));
-mod_api::impl_server_host_areas!(Server, except(services));
-mod_api::impl_backend_areas!(Server, except(entities, keys, levels, living, players));
-mod_api::impl_backend_mut_areas!(Server, except(living, players));
+mod_api::impl_host_areas!(Server, except(entities, keys, living, players));
+mod_api::impl_server_host_areas!(Server, except(projectiles, services));
+mod_api::impl_backend_areas!(
+    Server,
+    except(entities, keys, levels, living, players, projectiles)
+);
+mod_api::impl_backend_mut_areas!(Server, except(entities, levels, living, players));
 
 impl LivingClientBackend for Server {}
 impl PlayersClientBackend for Server {}
 
+impl EntitiesHost for Server {
+    fn entity(&self, id: u32) -> Option<EntityRef> {
+        EntitiesHost::entity(&self.fake, id)
+    }
+}
+impl PlayersHost for Server {
+    fn player(&self, uuid: u128) -> Option<PlayerRef> {
+        PlayersHost::player(&self.fake, uuid)
+    }
+}
+impl ProjectilesServerHost for Server {
+    fn fishing_hook(&self, entity: EntityRef) -> Option<FishingHookRef> {
+        (entity.id() == HOOK).then(|| FishingHookRef::new(entity))
+    }
+}
+impl ProjectilesBackend for Server {
+    fn fishing_hook_player_owner(&self, _: FishingHookRef) -> Option<EntityRef> {
+        EntitiesHost::entity(&self.fake, self.tick.hook_owner?)
+    }
+}
 impl KeysHost for Server {
     fn entity_type_keys(&self) -> Vec<EntityTypeKey> {
         self.types.clone()
@@ -114,16 +186,78 @@ impl KeysBackend for Server {
     fn entity_type_key_id(&self, key: EntityTypeKey) -> String {
         KeysBackend::entity_type_key_id(&self.fake, key)
     }
+    fn item_key_id(&self, key: ItemKey) -> String {
+        KeysBackend::item_key_id(&self.fake, key)
+    }
 }
 impl EntitiesBackend for Server {
+    fn entity_kind(&self, entity: EntityRef) -> Option<EntityTypeKey> {
+        EntitiesBackend::entity_kind(&self.fake, entity)
+    }
     fn entity_position(&self, entity: EntityRef) -> Option<[f64; 3]> {
         self.is_player(entity).then_some(POSITION)
     }
     fn entity_block_position(&self, entity: EntityRef) -> Option<[i32; 3]> {
         self.is_player(entity).then_some(BLOCK)
     }
+    fn entity_eye_position(&self, entity: EntityRef) -> Option<[f64; 3]> {
+        self.is_player(entity).then_some(EYES)
+    }
+    /// The player rides the sheep when the tick says so.
+    fn entity_vehicle(&self, entity: EntityRef) -> Option<EntityRef> {
+        let riding = self.is_player(entity) && self.tick.riding;
+        riding.then(|| EntitiesHost::entity(&self.fake, SHEEP))?
+    }
+    fn entity_fire_ticks(&self, entity: EntityRef) -> Option<i32> {
+        self.is_player(entity).then_some(self.tick.fire_ticks)
+    }
+}
+impl EntitiesBackendMut for Server {
+    /// The sheep's saved data: its colour.
+    fn entity_nbt(&mut self, entity: EntityRef) -> Option<Compound> {
+        let Tag::Compound(nbt) = Tag::compound([("Color", Tag::Byte(RED))]) else {
+            unreachable!()
+        };
+        (entity.id() == SHEEP).then_some(nbt)
+    }
+}
+impl LevelsBackendMut for Server {
+    fn level_spawn_item_with_motion(
+        &mut self,
+        _: LevelRef,
+        x: f64,
+        y: f64,
+        z: f64,
+        stack: ItemStack,
+        motion: [f64; 3],
+        pickup_delay: u32,
+    ) -> Result<Option<EntityRef>, StackWriteError> {
+        if self.spawn_refused {
+            return Ok(None);
+        }
+        let spawned = Some(([x, y, z], motion, pickup_delay));
+        Ok(Some(self.item(Item {
+            stack,
+            thrown: None,
+            spawned,
+        })))
+    }
 }
 impl LevelsBackend for Server {
+    /// The player and the entities [`AROUND`] them, for a box about the player.
+    fn level_entities_in(
+        &self,
+        _: LevelRef,
+        min: [f64; 3],
+        max: [f64; 3],
+    ) -> Option<Vec<EntityRef>> {
+        assert!((0..3).all(|i| min[i] < POSITION[i] && POSITION[i] < max[i]));
+        let ids = std::iter::once(ENTITY).chain(AROUND.map(|(id, _)| id));
+        Some(
+            ids.filter_map(|id| EntitiesHost::entity(&self.fake, id))
+                .collect(),
+        )
+    }
     fn level_block_state(&self, level: LevelRef, pos: [i32; 3]) -> Option<BlockState> {
         LevelsBackend::level_block_state(&self.fake, level, pos)
     }
@@ -179,6 +313,9 @@ impl LivingBackend for Server {
     fn living_health(&self, _: LivingRef) -> Option<f32> {
         Some(self.health)
     }
+    fn living_hand_item(&self, _: LivingRef, hand: Hand) -> Option<ItemStack> {
+        (self.tick.rod && hand == Hand::Main).then(|| self.rod.clone())
+    }
     fn living_attribute_value(&self, _: LivingRef, id: &str) -> Option<f64> {
         (id == "minecraft:max_health").then(|| self.max_health())
     }
@@ -208,19 +345,31 @@ impl LivingBackendMut for Server {
         throw_randomly: bool,
         include_thrower_name: bool,
     ) -> Result<Option<EntityRef>, StackWriteError> {
-        self.thrown
-            .push((stack, throw_randomly, include_thrower_name));
-        Ok(None)
+        if self.drop_refused {
+            return Ok(None);
+        }
+        let thrown = Some((throw_randomly, include_thrower_name));
+        Ok(Some(self.item(Item {
+            stack,
+            thrown,
+            spawned: None,
+        })))
     }
 }
 
-/// The player on stone, carrying [`STACKS`], with the server's entity types [`TYPES`].
+/// The player on stone, carrying [`STACKS`], with the server's entity types [`TYPES`] and the
+/// entities [`AROUND`], and the guest online beside them.
 fn server() -> Server {
     let mut fake = FakeHost::new();
     let items = STACKS.map(|(_, id, _)| Identifier::parse(id).unwrap());
-    fake.registries.resolve_items(items.clone()).unwrap();
+    let rod = Identifier::parse("minecraft:fishing_rod").unwrap();
+    let resolved = items.iter().cloned().chain([rod.clone()]);
+    fake.registries.resolve_items(resolved).unwrap();
     for (n, kind) in TYPES.into_iter().enumerate() {
         fake.level.entity(100 + n as u32, kind);
+    }
+    for (id, kind) in AROUND {
+        fake.level.entity(id, kind);
     }
     fake.resolve_entity_types().unwrap();
     mod_api::__private::resolve_block_keys(["minecraft:stone"], |_| {
@@ -244,13 +393,26 @@ fn server() -> Server {
         .collect();
     let player = fake.join(PLAYER, ENTITY);
     player.slots.extend(stacks);
+    fake.join(GUEST, GUEST_ENTITY);
+    // TYPES and the player's: not the entities around.
+    let types = mod_api::__private::entity_type_keys()
+        .into_iter()
+        .filter(|&key| {
+            let id = KeysBackend::entity_type_key_id(&fake, key);
+            !AROUND.iter().any(|(_, kind)| *kind == id)
+        })
+        .collect();
+    let rod = ItemStack::new(fake.item_key(&rod).unwrap(), 1).unwrap();
     Server {
         fake,
-        // TYPES and the player's.
-        types: mod_api::__private::entity_type_keys(),
+        types,
         modifiers: Vec::new(),
         health: 20.0,
-        thrown: Vec::new(),
+        tick: Tick::default(),
+        rod,
+        drop_refused: false,
+        spawn_refused: false,
+        items: Vec::new(),
     }
 }
 
@@ -291,9 +453,18 @@ struct Row {
     /// The lost-hearts modifier's amount.
     modifier: Option<f64>,
     health_after: Option<f32>,
-    /// The inventory slots left (all by default), and the stacks thrown.
+    /// The game's `living.drop` throws nothing, and neither does a spawned item.
+    drop_refused: bool,
+    spawn_refused: bool,
+    /// The host's player ticks after the payload, and what that tells the client.
+    tick: Option<Tick>,
+    facts: Option<HostFacts>,
+    /// The inventory slots left (all by default), and the item entities in the level.
     kept: Option<usize>,
-    thrown: usize,
+    items: usize,
+    /// Deaths, `(entity, kind, the source's causing entity)`, and the kills credited to the host.
+    deaths: &'static [(u32, &'static str, i32)],
+    credited: &'static [(u32, &'static str)],
 }
 
 #[test]
@@ -304,6 +475,7 @@ fn consequences_reach_the_host_player() {
         modifier: -2.0 * f64::from(lost),
     };
     let kill = "execute in minecraft:overworld run kill Player10";
+    let around = || vec![(SHEEP, "red")];
     let rows = [
         Row {
             name: "two effects, each for its seconds at its level less one",
@@ -315,6 +487,12 @@ fn consequences_reach_the_host_player() {
                 "effect give Player10 minecraft:slowness 20 4",
                 "effect give Player10 minecraft:regeneration 15 2",
             ],
+            ..Row::default()
+        },
+        Row {
+            name: "an instant effect's seconds are given as its ticks: Saturation for 100",
+            actions: vec![effect("minecraft:saturation", 5, 1)],
+            commands: vec!["effect give Player10 minecraft:saturation 100 0"],
             ..Row::default()
         },
         Row {
@@ -355,10 +533,10 @@ fn consequences_reach_the_host_player() {
             ..Row::default()
         },
         Row {
-            name: "the last heart kills",
+            name: "the tenth lost heart leaves half a heart: max health stops at its floor, 1",
             actions: vec![lost(10)],
-            commands: vec![kill],
             modifier: Some(-20.0),
+            health_after: Some(1.0),
             ..Row::default()
         },
         Row {
@@ -368,10 +546,28 @@ fn consequences_reach_the_host_player() {
             ..Row::default()
         },
         Row {
-            name: "the angry teacher throws everything on the ground",
+            name: "the angry teacher throws everything on the ground at the host's next tick",
             actions: vec![ServerAction::Wipe(Wipe::Drop)],
+            tick: Some(Tick::default()),
             kept: Some(0),
-            thrown: STACKS.len(),
+            items: STACKS.len(),
+            ..Row::default()
+        },
+        Row {
+            name: "where the game throws nothing, each stack is thrown from the eyes by hand",
+            actions: vec![ServerAction::Wipe(Wipe::Drop)],
+            drop_refused: true,
+            tick: Some(Tick::default()),
+            kept: Some(0),
+            items: STACKS.len(),
+            ..Row::default()
+        },
+        Row {
+            name: "a stack nothing throws stays in its slot",
+            actions: vec![ServerAction::Wipe(Wipe::Drop)],
+            drop_refused: true,
+            spawn_refused: true,
+            tick: Some(Tick::default()),
             ..Row::default()
         },
         Row {
@@ -381,15 +577,71 @@ fn consequences_reach_the_host_player() {
             ..Row::default()
         },
         Row {
-            name: "a dedicated server ignores it",
+            name: "a dedicated server ignores it, and credits no kill",
             sender: Sender::NoClient,
             actions: vec![ServerAction::Kill, ServerAction::Wipe(Wipe::Delete)],
+            deaths: &[(100, "minecraft:zombie", ENTITY as i32)],
             ..Row::default()
         },
         Row {
-            name: "a LAN guest's answers are ignored",
+            name: "a LAN guest's answers are ignored, and their kills are not the host's",
             sender: Sender::Guest,
             actions: vec![lost(1), ServerAction::Wipe(Wipe::Drop)],
+            deaths: &[(100, "minecraft:zombie", ENTITY as i32)],
+            ..Row::default()
+        },
+        Row {
+            name: "the host riding a sheep, burning and fishing: the client is told, by colour",
+            tick: Some(Tick {
+                riding: true,
+                fire_ticks: 5,
+                rod: true,
+                hook_owner: Some(ENTITY),
+            }),
+            facts: Some(HostFacts {
+                vehicle: Some("minecraft:red_sheep".into()),
+                fishing: true,
+                on_fire: true,
+                sheep: around(),
+            }),
+            ..Row::default()
+        },
+        Row {
+            name: "another player's hook is not his fishing",
+            tick: Some(Tick {
+                rod: true,
+                hook_owner: Some(GUEST_ENTITY),
+                ..Tick::default()
+            }),
+            facts: Some(HostFacts {
+                sheep: around(),
+                ..HostFacts::default()
+            }),
+            ..Row::default()
+        },
+        Row {
+            name: "his own hook with no rod in hand is not fishing either",
+            tick: Some(Tick {
+                hook_owner: Some(ENTITY),
+                ..Tick::default()
+            }),
+            facts: Some(HostFacts {
+                sheep: around(),
+                ..HostFacts::default()
+            }),
+            ..Row::default()
+        },
+        Row {
+            name: "the host's killing blows are his kills, a sheep by colour; no one else's are",
+            deaths: &[
+                (SHEEP, "minecraft:sheep", ENTITY as i32),
+                (100, "minecraft:zombie", ENTITY as i32),
+                (100, "minecraft:zombie", SKELETON as i32),
+                (100, "minecraft:zombie", GUEST_ENTITY as i32),
+                (100, "minecraft:zombie", 0),
+                (ENTITY, "minecraft:player", ENTITY as i32),
+            ],
+            credited: &[(SHEEP, "minecraft:red_sheep"), (100, "minecraft:zombie")],
             ..Row::default()
         },
     ];
@@ -405,12 +657,42 @@ fn consequences_reach_the_host_player() {
         let mut host = template.clone();
         let health = row.health.unwrap_or(20.0);
         host.health = health;
+        host.drop_refused = row.drop_refused;
+        host.spawn_refused = row.spawn_refused;
         let sent = Consequences {
             actions: row.actions.iter().map(Action::from).collect(),
         };
         let body = encode_payload(&sent, PAYLOAD_DECODE_BUDGET).unwrap();
         let received = decode_payload::<Consequences>(&body).unwrap();
-        receive(&mut host, player, &received);
+        let drop_waits = receive(&mut host, player, &received);
+        let host_drops = matches!(row.sender, Sender::Host)
+            && row.actions.contains(&ServerAction::Wipe(Wipe::Drop));
+        assert_eq!(
+            drop_waits, host_drops,
+            "{name}: the drop waits for the tick"
+        );
+        assert!(
+            host.items.is_empty(),
+            "{name}: nothing thrown before the tick"
+        );
+        if let Some(tick) = row.tick {
+            host.tick = tick;
+            let facts = ticked(&mut host, player, drop_waits);
+            if let Some(expected) = &row.facts {
+                assert_eq!(facts, *expected, "{name}");
+            }
+        }
+        let credited: Vec<_> = row
+            .deaths
+            .iter()
+            .filter_map(|&(entity, kind, causing)| kill_credit(&mut host, entity, kind, causing))
+            .collect();
+        let expected: Vec<_> = row
+            .credited
+            .iter()
+            .map(|&(id, kind)| (id, kind.into()))
+            .collect();
+        assert_eq!(credited, expected, "{name}");
 
         let ran = &host.fake.commands.ran;
         match row.mobs {
@@ -450,9 +732,25 @@ fn consequences_reach_the_host_player() {
         assert_eq!(host.health, row.health_after.unwrap_or(health), "{name}");
         let kept = host.fake.players.get(PLAYER).unwrap().slots.len();
         assert_eq!(kept, row.kept.unwrap_or(STACKS.len()), "{name}");
-        assert_eq!(host.thrown.len(), row.thrown, "{name}");
-        for (_, randomly, named) in &host.thrown {
-            assert_eq!((*randomly, *named), (true, false), "{name}");
+        // Each stack is in the level once: thrown at random without a thrower, or from the eyes
+        // less 0.3, up 0.2 and across up to 0.5 a tick, picked up after 40 ticks.
+        let counts: Vec<_> = host.items.iter().map(|item| item.stack.count()).collect();
+        let all = STACKS.map(|(_, _, count)| count);
+        assert_eq!(counts, all[..row.items], "{name}");
+        for item in &host.items {
+            assert_eq!(item.thrown.is_some(), !row.drop_refused, "{name}");
+            if let Some(flags) = item.thrown {
+                assert_eq!(flags, (true, false), "{name}");
+            }
+            if let Some(([x, y, z], [dx, dy, dz], delay)) = item.spawned {
+                assert_eq!(
+                    [x, y, z],
+                    [EYES[0], EYES[1] - f64::from(0.3f32), EYES[2]],
+                    "{name}"
+                );
+                assert_eq!((dy, delay), (f64::from(0.2f32), 40), "{name}");
+                assert!(dx.hypot(dz) <= 0.5, "{name}: {dx} {dz}");
+            }
         }
     }
 }

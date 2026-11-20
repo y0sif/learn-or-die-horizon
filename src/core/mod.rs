@@ -32,6 +32,7 @@ pub use hud::{HudText, Span, spans};
 pub use pack::{Lipsync, Meta, Pack, Part, Phrase, Pictures, Sprite, Word};
 pub use progress::{Progress, REST_FOREVER_MS, World, server_world_key, singleplayer_world_key};
 pub use quiz::{OpenQuestion, QuestionKind, QuizEvent};
+pub(crate) use rng::Rng;
 pub use settings::{Page, Setting, Shown, settings};
 pub use speaker::SoundCommand;
 pub use teacher::{Fate, Outcome, Teacher, Typed, WorldTick};

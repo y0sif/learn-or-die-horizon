@@ -9,20 +9,67 @@
 //! Effects, kills and mobs go through the server's command dispatcher as the console (permission
 //! 4, output suppressed), as the original summons its mobs; `/effect give` and `/kill` build the
 //! same `MobEffectInstance` and make the same `kill(level)` call the original makes directly. The
-//! lost hearts and the inventory use the API.
+//! lost hearts and the inventory use the API. The drop waits for the host's own tick
+//! ([`host_tick`]), where their state is in place.
+//!
+//! The same process's client reads what only this server knows of its host, through shared state
+//! ([`super::detect`]): each tick of the host's player their vehicle, fishing hook, fire and the
+//! colours of the sheep within reach ([`host_tick`]), and each death the host dealt the killing
+//! blow to ([`kill_credit`]).
+use super::detect::{self, HostFacts};
 use super::payload::{Action, Consequences};
 use super::{lock, log_info, log_warn};
-use crate::core::{HeartsAfter, LOST_HEARTS_MODIFIER, after_lost_hearts, mob_pool, summons};
+use crate::core::{HeartsAfter, LOST_HEARTS_MODIFIER, Rng, after_lost_hearts, mob_pool, summons};
 use mod_api::{
-    AttributeModifier, AttributeOperation, BlockShapeKind, Identifier, ModifierLifetime, PlayerRef,
-    ServerHost,
+    AttributeModifier, AttributeOperation, BlockShapeKind, EntityRef, Hand, Identifier, ItemStack,
+    ModifierLifetime, PlayerRef, ServerHost, Tag,
 };
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The local player of this process's client, by UUID, set as it sends consequences.
+/// The local player of this process's client, by UUID: the client half sets it in single player
+/// and as it sends consequences.
 pub(crate) static HOST_PLAYER: Mutex<Option<u128>> = Mutex::new(None);
 
+/// The angry teacher's drop waits for the host's next tick ([`host_tick`]).
+static DROP_WAITING: Mutex<bool> = Mutex::new(false);
+
 const MAX_HEALTH: &str = "minecraft:max_health";
+const SHEEP: &str = "minecraft:sheep";
+const FISHING_ROD: &str = "minecraft:fishing_rod";
+
+/// `MobEffect.isInstantenous`: vanilla's `InstantenousMobEffect`s.
+const INSTANT_EFFECTS: [&str; 3] = [
+    "minecraft:instant_health",
+    "minecraft:instant_damage",
+    "minecraft:saturation",
+];
+
+/// `DyeColor` by id, as a sheep's `Color` names it.
+const DYE_COLOURS: [&str; 16] = [
+    "white",
+    "orange",
+    "magenta",
+    "light_blue",
+    "yellow",
+    "lime",
+    "pink",
+    "gray",
+    "light_gray",
+    "cyan",
+    "purple",
+    "blue",
+    "brown",
+    "green",
+    "red",
+    "black",
+];
+
+/// How far from the player a cast hook may be (`FishingHook.shouldStopFishing`: 32 blocks).
+const HOOK_REACH: f64 = 33.0;
+/// How far from the player's eyes a sheep is looked at for its colour: past the creative
+/// interaction range (5) and a sheep's box.
+const SHEEP_REACH: f64 = 8.0;
 
 /// Vanilla's entity types by `MobCategory` (`EntityType.getCategory`), as far as the mob pool asks:
 /// the API reads an entity's category but no type's. Every other type counts as `misc`, so a type
@@ -63,6 +110,7 @@ const CATEGORIES: [(&str, &[&str]); 7] = [
             "slime",
             "spider",
             "stray",
+            "sulfur_cube",
             "vex",
             "vindicator",
             "warden",
@@ -71,6 +119,7 @@ const CATEGORIES: [(&str, &[&str]); 7] = [
             "wither_skeleton",
             "zoglin",
             "zombie",
+            "zombie_horse",
             "zombie_nautilus",
             "zombie_villager",
             "zombified_piglin",
@@ -105,11 +154,11 @@ const CATEGORIES: [(&str, &[&str]); 7] = [
             "skeleton_horse",
             "sniffer",
             "strider",
+            "tadpole",
             "trader_llama",
             "turtle",
             "wandering_trader",
             "wolf",
-            "zombie_horse",
         ],
     ),
     ("ambient", &["bat"]),
@@ -118,7 +167,7 @@ const CATEGORIES: [(&str, &[&str]); 7] = [
     ("water_creature", &["dolphin", "nautilus", "squid"]),
     (
         "water_ambient",
-        &["cod", "pufferfish", "salmon", "tadpole", "tropical_fish"],
+        &["cod", "pufferfish", "salmon", "tropical_fish"],
     ),
 ];
 
@@ -140,15 +189,27 @@ struct Target {
     dimension: String,
 }
 
-/// The payload's handler: applies `payload` to `player` when they are this process's own client
-/// player, else nothing.
-pub(crate) fn receive(host: &mut dyn ServerHost, player: PlayerRef, payload: &Consequences) {
+/// The payload's handler: [`receive`], and a drop it leaves waits for the host's next tick.
+pub(crate) fn handle(host: &mut dyn ServerHost, player: PlayerRef, payload: &Consequences) {
+    if receive(host, player, payload) {
+        *lock(&DROP_WAITING) = true;
+    }
+}
+
+/// Applies `payload` to `player` when they are this process's own client player, else nothing.
+/// True when the angry teacher's drop is left for the player's next tick ([`ticked`]): the
+/// handler runs outside any player's turn, and a drop thrown there left no item in game.
+pub(crate) fn receive(
+    host: &mut dyn ServerHost,
+    player: PlayerRef,
+    payload: &Consequences,
+) -> bool {
     if *lock(&HOST_PLAYER) != Some(player.uuid()) {
         log_info("consequences from a player who is not the host ignored".into());
-        return;
+        return false;
     }
     let (Some(name), Some(dimension)) = (player.name(&*host), player.dimension(&*host)) else {
-        return;
+        return false;
     };
     let target = Target {
         player,
@@ -156,6 +217,7 @@ pub(crate) fn receive(host: &mut dyn ServerHost, player: PlayerRef, payload: &Co
         dimension: dimension.to_string(),
     };
     let mut effects = Vec::new();
+    let mut drop_waits = false;
     for action in &payload.actions {
         match action {
             Action::Effect {
@@ -170,21 +232,30 @@ pub(crate) fn receive(host: &mut dyn ServerHost, player: PlayerRef, payload: &Co
             Action::Mobs { hostile, seed } => mobs(host, &target, *hostile, *seed as u64),
             Action::LostHearts { lost, modifier } => lost_hearts(host, &target, *lost, *modifier),
             Action::Kill => kill(host, &target),
-            Action::Wipe { delete } => wipe(host, &target, *delete),
+            Action::Wipe { delete: true } => delete_all(host, target.player),
+            Action::Wipe { delete: false } => drop_waits = true,
         }
     }
     if !effects.is_empty() {
         log_info(format!("effects: {}", effects.join(", ")));
     }
+    drop_waits
 }
 
 /// `addEffect(new MobEffectInstance(effect, seconds * 20, amplifier))`, through `/effect give`,
-/// which builds that instance. False for an id that is not one.
+/// which builds that instance. It reads an instant effect's seconds as ticks
+/// (`EffectCommands`' `computeDurationInTicks`), so an instant one is given `seconds * 20` there.
+/// False for an id that is not one.
 fn effect(host: &mut dyn ServerHost, target: &Target, id: &str, seconds: i32, amp: i32) -> bool {
     if Identifier::parse(id).is_err() {
         log_warn(format!("not an effect id: {id:?}"));
         return false;
     }
+    let seconds = if INSTANT_EFFECTS.contains(&id) {
+        seconds.saturating_mul(20)
+    } else {
+        seconds
+    };
     let line = format!("effect give {} {id} {seconds} {amp}", target.name);
     host.commands().run_command(&line)
 }
@@ -270,20 +341,198 @@ fn lost_hearts(host: &mut dyn ServerHost, target: &Target, lost: i32, modifier: 
     }
 }
 
-/// `Inventory.dropAll()` (each stack thrown at random, without the thrower's name) or
-/// `clearContent()`, over every slot, armour and off hand included. Each emptied slot reaches the
-/// client with the tick's inventory sync (`containerMenu.broadcastChanges()`).
-fn wipe(host: &mut dyn ServerHost, target: &Target, delete: bool) {
-    let player = target.player;
+/// `Inventory.clearContent()`, over every slot, armour and off hand included. Each emptied slot
+/// reaches the client with the tick's inventory sync (`containerMenu.broadcastChanges()`).
+fn delete_all(host: &mut dyn ServerHost, player: PlayerRef) {
+    for (slot, _) in player.inventory_slots(&*host).unwrap_or_default() {
+        let _ = player.set_inventory_slot(host, slot, None);
+    }
+}
+
+/// `Inventory.dropAll()`: each stack thrown from the eyes at random, without the thrower's name
+/// (`player.drop(stack, true, false)`), then its slot emptied; a stack nothing threw stays in its
+/// slot. Armour and off hand included.
+fn drop_all(host: &mut dyn ServerHost, player: PlayerRef) {
     let living = host.living(player.entity());
+    let mut rng = Rng::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64),
+    );
+    let (mut by_game, mut by_hand, mut kept) = (0, 0, 0);
     for (slot, stack) in player.inventory_slots(&*host).unwrap_or_default() {
-        if player.set_inventory_slot(host, slot, None).is_err() || delete {
-            continue;
-        }
-        if let Some(living) = living {
-            let _ = living.drop(host, stack, true, false);
+        let thrown = if living.is_some_and(|living| {
+            matches!(living.drop(host, stack.clone(), true, false), Ok(Some(_)))
+        }) {
+            by_game += 1;
+            true
+        } else if throw(host, player, stack, &mut rng) {
+            by_hand += 1;
+            true
+        } else {
+            false
+        };
+        if !thrown || player.set_inventory_slot(host, slot, None).is_err() {
+            kept += 1;
         }
     }
+    let line = format!("angry drop: {by_game} stacks thrown, {by_hand} by hand, {kept} kept");
+    if kept > 0 {
+        log_warn(line);
+    } else {
+        log_info(line);
+    }
+}
+
+/// `Player.drop(stack, true, false)` by hand, where `living.drop` threw nothing: an item at the
+/// eyes less 0.3, thrown up 0.2 and across up to 0.5 a tick at a random angle, picked up after
+/// 40 ticks. The spread comes from the mod's random, not the player's.
+fn throw(host: &mut dyn ServerHost, player: PlayerRef, stack: ItemStack, rng: &mut Rng) -> bool {
+    let (Some([x, y, z]), Some(level)) =
+        (player.entity().eye_position(&*host), player.level(&*host))
+    else {
+        return false;
+    };
+    // `Random.nextFloat`: 24 bits.
+    let mut next_float = || (rng.next_u64() >> 40) as f32 / (1u32 << 24) as f32;
+    let spread = next_float() * 0.5;
+    let angle = next_float() * std::f32::consts::TAU;
+    let motion = [
+        f64::from(-angle.sin() * spread),
+        f64::from(0.2f32),
+        f64::from(angle.cos() * spread),
+    ];
+    let y = y - f64::from(0.3f32);
+    matches!(
+        level.spawn_item_with_motion(host, x, y, z, stack, motion, 40),
+        Ok(Some(_))
+    )
+}
+
+/// The integrated server reset (started or stopped): no drop waits, and the client hears no more
+/// of its host.
+pub(crate) fn reset() {
+    *lock(&DROP_WAITING) = false;
+    detect::set_host_facts(None);
+    detect::clear_host_kills();
+}
+
+/// `player_tick_post` on the integrated server: for this process's own client player, [`ticked`]
+/// with the drop the payload left; `None` for any other player.
+pub(crate) fn host_tick(host: &mut dyn ServerHost, player: PlayerRef) -> Option<HostFacts> {
+    if *lock(&HOST_PLAYER) != Some(player.uuid()) {
+        return None;
+    }
+    let drop_waits = std::mem::take(&mut *lock(&DROP_WAITING));
+    Some(ticked(host, player, drop_waits))
+}
+
+/// The host's player ticked, their state in place: the angry teacher's waiting drop is thrown,
+/// then what a client cannot read of them (Java's client reads `getVehicle`, `player.fishing`
+/// and `isOnFire`), and the colours of the sheep within reach for the hit and feed sentences.
+pub(crate) fn ticked(host: &mut dyn ServerHost, player: PlayerRef, drop_waits: bool) -> HostFacts {
+    if drop_waits {
+        drop_all(host, player);
+    }
+    let entity = player.entity();
+    let vehicle = entity
+        .vehicle(&*host)
+        .and_then(|vehicle| entity_path(host, vehicle));
+    HostFacts {
+        vehicle,
+        fishing: fishing(&*host, player),
+        on_fire: entity.fire_ticks(&*host).is_some_and(|ticks| ticks > 0),
+        sheep: sheep_near(host, player),
+    }
+}
+
+/// `player.fishing != null`: a cast hook of the player's is out. A hook goes once neither hand
+/// holds a rod (`FishingHook.shouldStopFishing`), so the hooks around are looked at only while
+/// one does.
+fn fishing(host: &dyn ServerHost, player: PlayerRef) -> bool {
+    let entity = player.entity();
+    let rod = host.living(entity).is_some_and(|living| {
+        Hand::BOTH.into_iter().any(|hand| {
+            living
+                .hand_item(host, hand)
+                .is_some_and(|stack| stack.item().id(host) == FISHING_ROD)
+        })
+    });
+    let (true, Some(at), Some(level)) = (rod, entity.position(host), player.level(host)) else {
+        return false;
+    };
+    let around = level.entities_in(host, at.map(|c| c - HOOK_REACH), at.map(|c| c + HOOK_REACH));
+    around
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|near| host.fishing_hook(near))
+        .any(|hook| {
+            hook.player_owner(host)
+                .is_some_and(|owner| owner.id() == entity.id())
+        })
+}
+
+/// The sheep within reach of the player's eyes: their entity ids and colours.
+fn sheep_near(host: &mut dyn ServerHost, player: PlayerRef) -> Vec<(u32, &'static str)> {
+    let (Some(eye), Some(level)) = (player.entity().eye_position(&*host), player.level(&*host))
+    else {
+        return Vec::new();
+    };
+    let min = eye.map(|c| c - SHEEP_REACH);
+    let max = eye.map(|c| c + SHEEP_REACH);
+    let mut sheep = Vec::new();
+    for near in level.entities_in(&*host, min, max).unwrap_or_default() {
+        if near
+            .kind(&*host)
+            .is_some_and(|kind| kind.id(&*host) == SHEEP)
+            && let Some(colour) = sheep_colour(host, near)
+        {
+            sheep.push((near.id(), colour));
+        }
+    }
+    sheep
+}
+
+/// A sheep's colour, from its saved `Color` (`DyeColor` by id).
+fn sheep_colour(host: &mut dyn ServerHost, sheep: EntityRef) -> Option<&'static str> {
+    match Tag::Compound(sheep.nbt(host)?).get("Color") {
+        Some(&Tag::Byte(id)) => Some(DYE_COLOURS[(id as u8 & 15) as usize]),
+        _ => None,
+    }
+}
+
+/// An entity's type id as the original names it (`ActionDetector.entityPath`): a sheep as
+/// `<colour>_sheep`.
+fn entity_path(host: &mut dyn ServerHost, entity: EntityRef) -> Option<String> {
+    let kind = entity.kind(&*host)?.id(&*host);
+    if kind == SHEEP
+        && let Some(colour) = sheep_colour(host, entity)
+    {
+        return Some(format!("minecraft:{colour}_sheep"));
+    }
+    Some(kind)
+}
+
+/// `living_death`: the host's player dealt the killing blow (the source's `getEntity`: their own
+/// hand, or a projectile they own), so the entity `entity` of type `kind` is their kill: its id
+/// and type, a sheep as `<colour>_sheep`. `None` for any other death. The original credits the
+/// player's own projectiles only, by their owner, which a client cannot read.
+pub(crate) fn kill_credit(
+    host: &mut dyn ServerHost,
+    entity: u32,
+    kind: &str,
+    causing: i32,
+) -> Option<(u32, String)> {
+    let uuid = (*lock(&HOST_PLAYER))?;
+    let own = host.player(uuid)?.entity().id();
+    if causing <= 0 || causing as u32 != own || entity == own {
+        return None;
+    }
+    let path = match host.entity(entity) {
+        Some(dead) if kind == SHEEP => entity_path(host, dead),
+        _ => None,
+    };
+    Some((entity, path.unwrap_or_else(|| kind.to_string())))
 }
 
 #[cfg(test)]

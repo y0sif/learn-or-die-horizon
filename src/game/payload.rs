@@ -1,5 +1,5 @@
 //! The consequences payload: what a quiz answer does on the integrated server, sent by the client
-//! half ([`send_consequences`]) and applied by the server half ([`super::server::receive`]).
+//! half ([`send_consequences`]) and applied by the server half ([`super::server::handle`]).
 //!
 //! The original reaches into the integrated server in its own process (`server.execute`). Horizon
 //! keeps the halves apart, so the client sends the core's [`ServerAction`]s on a typed payload. It
@@ -75,7 +75,7 @@ pub(crate) fn register(r: &mut dyn Registrar) {
         |payload, cx| {
             let player = cx.player().map_err(|e| format!("{e:?}"))?;
             let host = cx.server_host().map_err(|e| format!("{e:?}"))?;
-            server::receive(host, player, &payload);
+            server::handle(host, player, &payload);
             Ok(())
         },
     );

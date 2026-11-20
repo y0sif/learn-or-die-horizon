@@ -5,13 +5,19 @@
 //! tick's state for the core's detector (the player's state, the keys, the weather and the
 //! biome, the inventory for pickups, the block being mined, the fates of the entities he hit).
 //!
-//! A client reads no health of another entity, so whether one is hurt or dying comes from how
-//! the game draws it (`render_living_pre`: its hurt flash and death time), kept for one tick.
+//! A client reads no health of another entity, so whether one is dying comes from how the game
+//! draws it (`render_living_pre`: its death time), kept for one tick.
 //!
 //! Some of the player's own state reaches the layer through hooks rather than reads, and is put
 //! into the tick's view by [`merge_events`]: the drop key (`key_mapping_pre`: the `mapping` read
 //! answers the movement keys, attack and use only), the fire over the view (a client reads no
 //! fire ticks), and what the integrated server knows of its host's player ([`HostFacts`]).
+//!
+//! Kills: the player's melee hits are watched (`entity_attacked`) and one drawn dying within 6 s
+//! is his kill, as the original. A client cannot read a projectile's owner, so the kills by the
+//! player's own projectiles come only from the integrated server ([`host_killed`], single
+//! player): off it, no projectile counts. In single player a sheep is named by its colour, also
+//! from the integrated server.
 use super::client::{Client, View};
 use super::{STATE, State, lock};
 use crate::core::{Fate, Teacher, WorldTick};
@@ -21,9 +27,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 const PLACE_WAIT_MS: i64 = 500;
-/// `hurtDuration`: the hurt flash's ticks, as a hit sets it. A frame of the tick after the hit
-/// may show one less.
-const HURT_TICKS: i32 = 10;
+const SHEEP: &str = "minecraft:sheep";
 
 /// The Hardcore flag of the world, as the health bar's inputs last showed it.
 static HARDCORE: AtomicBool = AtomicBool::new(false);
@@ -39,8 +43,9 @@ static FIRE_DRAWN_AT: AtomicI64 = AtomicI64::new(i64::MIN);
 const FIRE_FRAME_MS: i64 = 250;
 
 /// What the integrated server knows of its host's own player that a client cannot read
-/// (`Entity.getVehicle`, `Player.fishing`, `Entity.isOnFire` in either camera). The server's half
-/// sets it, in single player and on the host of a LAN world; the client reads it only there.
+/// (`Entity.getVehicle`, `Player.fishing`, `Entity.isOnFire` in either camera, a sheep's colour).
+/// The server's half sets it every tick of that player, in single player and on the host of a
+/// LAN world; the client reads it only there.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct HostFacts {
     /// The vehicle's entity type id (a sheep is `<colour>_sheep`).
@@ -48,17 +53,66 @@ pub(crate) struct HostFacts {
     /// A cast fishing hook of the player's is out.
     pub(crate) fishing: bool,
     pub(crate) on_fire: bool,
+    /// The sheep within the player's reach, by entity id, and their colours (`DyeColor`'s
+    /// names), for the hit and feed sentences.
+    pub(crate) sheep: Vec<(u32, &'static str)>,
 }
 
 static HOST_FACTS: Mutex<Option<HostFacts>> = Mutex::new(None);
 
+/// The kills the integrated server credited to its host's player since the client last took them:
+/// `(entity id, entity type id)`, a sheep as `<colour>_sheep`. At most [`HOST_KILLS_KEPT`].
+static HOST_KILLS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+const HOST_KILLS_KEPT: usize = 64;
+
+/// The window owns the integrated server it plays on, as the last tick's view showed it: the
+/// hooks between ticks read the server's facts only then.
+static SINGLEPLAYER: AtomicBool = AtomicBool::new(false);
+
 /// From the integrated server's half: its host's player now, `None` once it stops.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the server's half (server.rs) is to set it")
-)]
 pub(crate) fn set_host_facts(facts: Option<HostFacts>) {
     *lock(&HOST_FACTS) = facts;
+}
+
+/// From the integrated server's half (`living_death`): its host's player dealt the killing blow
+/// to the entity `entity` of type `kind`.
+pub(crate) fn host_killed(entity: u32, kind: String) {
+    let mut kills = lock(&HOST_KILLS);
+    if kills.len() >= HOST_KILLS_KEPT {
+        kills.remove(0);
+    }
+    kills.push((entity, kind));
+}
+
+/// From the integrated server's half as it starts or stops: no kill of its is said any more.
+pub(crate) fn clear_host_kills() {
+    lock(&HOST_KILLS).clear();
+}
+
+/// The kills the integrated server credited to this window's player since the last world tick,
+/// as `(entity, entity type id)`; none off single player.
+pub(crate) fn credited_kills(view: &View) -> Vec<(u64, String)> {
+    let kills = std::mem::take(&mut *lock(&HOST_KILLS));
+    if !view.singleplayer {
+        return Vec::new();
+    }
+    kills
+        .into_iter()
+        .map(|(entity, kind)| (u64::from(entity), kind))
+        .collect()
+}
+
+/// The entity type id the teacher names an entity by (Java `entityPath`): in single player a
+/// sheep the integrated server told the colour of as `<colour>_sheep`, else `kind`.
+fn entity_path(entity: u32, kind: &str) -> String {
+    if kind == SHEEP
+        && SINGLEPLAYER.load(Ordering::Relaxed)
+        && let Some(facts) = lock(&HOST_FACTS).as_ref()
+        && let Some((_, colour)) = facts.sheep.iter().find(|(id, _)| *id == entity)
+    {
+        return format!("minecraft:{colour}_sheep");
+    }
+    kind.to_string()
 }
 
 /// From the `key_mapping_pre` hook: a physical key or button bound to `mapping` went down or up.
@@ -90,8 +144,15 @@ pub(crate) fn merge_events(view: &mut View, now: i64) {
     }
     let since_fire = now.saturating_sub(FIRE_DRAWN_AT.load(Ordering::Relaxed));
     view.on_fire |= (0..=FIRE_FRAME_MS).contains(&since_fire);
+    SINGLEPLAYER.store(view.singleplayer, Ordering::Relaxed);
     if !view.singleplayer {
+        lock(&HOST_KILLS).clear();
         return;
+    }
+    // The integrated server's half knows its host by this. A view without a player's UUID
+    // names no one.
+    if view.uuid != 0 {
+        *lock(&super::server::HOST_PLAYER) = Some(view.uuid);
     }
     if let Some(facts) = lock(&HOST_FACTS).clone() {
         view.vehicle = view.vehicle.take().or(facts.vehicle);
@@ -101,18 +162,8 @@ pub(crate) fn merge_events(view: &mut View, now: i64) {
     }
 }
 
-/// Living entities drawn hurt or dying since the last client tick.
-struct Sightings {
-    /// Drawn with a fresh hurt flash: `(network id, entity type id)`.
-    hurt: Vec<(u32, String)>,
-    /// Drawn with a death time.
-    dying: Vec<u32>,
-}
-
-static SIGHTINGS: Mutex<Sightings> = Mutex::new(Sightings {
-    hurt: Vec::new(),
-    dying: Vec::new(),
-});
+/// Living entities drawn dying (with a death time) since the last client tick, by network id.
+static DYING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// From the `health_hud` hook: whether the world is a Hardcore one.
 pub(crate) fn set_hardcore(hardcore: bool) {
@@ -123,38 +174,26 @@ pub(crate) fn hardcore() -> bool {
     HARDCORE.load(Ordering::Relaxed)
 }
 
-/// From the `render_living_pre` hook, for every living entity drawn: one hurt this tick or dying
-/// is kept until the tick's end. Most are neither, and cost two comparisons.
+/// From the `render_living_pre` hook, for every living entity drawn: one dying is kept until the
+/// tick's end. Most are not, and cost one comparison.
 pub(crate) fn drawn(mob: &MobRender<'_>) {
-    let hurt = mob.hurt_time >= HURT_TICKS - 1;
-    if (!hurt && mob.death_time <= 0) || !super::hosting() {
+    if mob.death_time <= 0 || !super::hosting() {
         return;
     }
-    let mut seen = lock(&SIGHTINGS);
-    if mob.death_time > 0 {
-        if !seen.dying.contains(&mob.id) {
-            seen.dying.push(mob.id);
-        }
-    } else if !seen.hurt.iter().any(|(id, _)| *id == mob.id) {
-        seen.hurt.push((mob.id, mob.kind.to_string()));
+    let mut dying = lock(&DYING);
+    if !dying.contains(&mob.id) {
+        dying.push(mob.id);
     }
 }
 
 /// The entity was drawn dying since the last tick.
 pub(crate) fn seen_dying(id: u32) -> bool {
-    lock(&SIGHTINGS).dying.contains(&id)
-}
-
-/// The entities drawn with a fresh hurt flash since the last tick.
-pub(crate) fn seen_hurt() -> Vec<(u32, String)> {
-    lock(&SIGHTINGS).hurt.clone()
+    lock(&DYING).contains(&id)
 }
 
 /// The tick is over: what was drawn before it is forgotten.
 pub(crate) fn end_tick() {
-    let mut seen = lock(&SIGHTINGS);
-    seen.hurt.clear();
-    seen.dying.clear();
+    lock(&DYING).clear();
 }
 
 /// A block the player went for, and what they held.
@@ -309,21 +348,25 @@ pub(crate) fn attacked(host: &dyn ClientHost, target: EntityRef) {
     let Some(struck) = io.struck(host, target) else {
         return;
     };
+    let kind = u32::try_from(struck.id)
+        .map_or_else(|_| struck.kind.clone(), |id| entity_path(id, &struck.kind));
     let now = io.now();
     let mut state = lock(&STATE);
     let State { teacher, game } = &mut *state;
     if let Some(teacher) = teacher.as_mut()
         && game.level.is_some()
     {
-        teacher.entity_attacked(now, struck.id, &struck.kind, struck.living, struck.dying);
+        teacher.entity_attacked(now, struck.id, &kind, struck.living, struck.dying);
     }
 }
 
-/// A main-hand right click on an entity (Java `UseEntityCallback`, from the client side of
-/// `entity_interact`).
-pub(crate) fn entity_used(host: &dyn ClientHost, entity: &str, stack: Option<&ItemStack>) {
+/// A main-hand right click on the entity `id` of type `kind` (Java `UseEntityCallback`, from the
+/// client side of `entity_interact`).
+pub(crate) fn entity_used(host: &dyn ClientHost, id: i32, kind: &str, stack: Option<&ItemStack>) {
     let io = super::io();
     let (item, food) = io.used_item(host, stack);
+    let entity = u32::try_from(id).map_or_else(|_| kind.to_string(), |id| entity_path(id, kind));
+    let entity = entity.as_str();
     let now = io.now();
     let mut state = lock(&STATE);
     let State { teacher, game } = &mut *state;
@@ -334,33 +377,30 @@ pub(crate) fn entity_used(host: &dyn ClientHost, entity: &str, stack: Option<&It
     }
 }
 
-/// What became of the entities the teacher watches for a kill.
-pub(crate) fn fates(host: &dyn ClientHost, io: &dyn Client, teacher: &Teacher) -> Vec<(u64, Fate)> {
-    let watched: Vec<u64> = teacher.watched_entities().collect();
-    if watched.is_empty() {
-        return Vec::new();
-    }
-    io.entity_fates(host, &watched)
-}
-
-/// Who the player's projectiles hurt this tick, asked only while kills are said.
-pub(crate) fn hits(
+/// The integrated server's `credited` kills dying, then what became of the entities the teacher
+/// watches for a kill. A credited kill comes first, so it is said even when the client no
+/// longer has the entity.
+pub(crate) fn fates(
     host: &dyn ClientHost,
     io: &dyn Client,
     teacher: &Teacher,
-) -> Vec<(u64, String)> {
-    if !teacher.config.say_kills {
-        return Vec::new();
+    credited: &[(u64, String)],
+) -> Vec<(u64, Fate)> {
+    let mut fates: Vec<(u64, Fate)> = credited.iter().map(|&(id, _)| (id, Fate::Dying)).collect();
+    let watched: Vec<u64> = teacher.watched_entities().collect();
+    if !watched.is_empty() {
+        fates.extend(io.entity_fates(host, &watched));
     }
-    io.projectile_hits(host)
+    fates
 }
 
-/// The core's input for one world tick.
+/// The core's input for one world tick. The integrated server's `credited` kills are the hits
+/// the core watches, and are dying in `entity_fates`, so each is said once.
 pub(crate) fn world_tick<'a>(
     view: &'a View,
     inventory: Option<&'a [(&'a str, i32)]>,
     breaking: Option<&'a str>,
-    projectile_hits: &'a [(u64, &'a str)],
+    credited: &'a [(u64, &'a str)],
     entity_fates: &'a [(u64, Fate)],
     now: i64,
 ) -> WorldTick<'a> {
@@ -409,7 +449,7 @@ pub(crate) fn world_tick<'a>(
         biome_rains: view.biome_rains,
         biome_snows: view.biome_snows,
         biome_temperature: view.biome_temperature,
-        projectile_hits,
+        projectile_hits: credited,
         entity_fates,
     }
 }
