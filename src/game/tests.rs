@@ -459,10 +459,11 @@ fn hooks_drive_the_teacher() {
 
         // A split-screen player's turn: its game shares this process, but its hooks leave the
         // teacher alone. Picking its profile it is in no world, which does not take him out of
-        // this window's world, and its view gets no HUD.
+        // this window's world, its Disconnect does not either, and its view gets no HUD.
         let own = io.session().view.take();
         io.session().seat = 1;
         tick(&mut host, &io, 50);
+        mod_api::dispatch_client_player_logging_out(&mut host, None, None);
         let mut canvas = Canvas::default();
         mod_api::dispatch_gui_layer_draw(&host, LAYER, &mut canvas);
         io.session().seat = 0;
