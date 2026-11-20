@@ -85,7 +85,6 @@ pub(crate) fn register(r: &mut dyn Registrar) {
 /// Sends an answer's [`Outcome.server`](crate::core::Outcome) actions to the integrated server,
 /// for the local player. Nothing is sent for an empty list. Whether the payload was queued; a
 /// failure is logged.
-#[expect(dead_code, reason = "the answer path (lane S2-3) calls it")]
 pub(crate) fn send_consequences(host: &mut dyn ClientHost, actions: &[ServerAction]) -> bool {
     if actions.is_empty() {
         return false;

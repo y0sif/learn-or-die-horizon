@@ -1,26 +1,32 @@
 //! The wiring: one scripted session dispatches the client hooks through the SDK's test support
 //! and checks what the teacher played, drew, asked and saved. The client seam answers the client
 //! reads and writes the fake host cannot; the pack is invented for the test.
-use super::client::{Click, Client, Store, View};
+use super::client::{Click, Client, Store, Struck, View};
 use super::hud::LAYER;
+use super::settings::Page;
 use super::{
-    files, keys, lock, quiz_pauses, set_io, take_escape_pause, take_log_lines, with_state, world,
+    NO_SERVER_LINE, files, keys, lock, quiz_pauses, set_io, take_escape_pause, take_log_lines,
+    with_state, world,
 };
+use crate::core::{Fate, QuestionKind, ServerAction};
+use mod_api::client::widgets::{TextFieldLayout, TextFieldView};
 use mod_api::serde_json::{self, Value};
 use mod_api::testing::{FakeHost, with_mods};
 use mod_api::text::TextContent;
 use mod_api::{
-    BlockClick, BlockHit, ClientHost, DrawContext, GuiDraw, Hand, HostSide, InteractionAttempt,
-    InteractionKey, InteractionResult, ItemKey, LevelDimension, LogicalSide, ModEntry, ScreenView,
-    SoundPlay, SoundRef, SoundSource, Text, TextFormError, TriState,
+    BlockClick, BlockHit, ClientHost, DrawContext, EntityRef, GuiDraw, Hand, HostSide,
+    InteractionAttempt, InteractionKey, InteractionResult, ItemKey, ItemStack, LevelDimension,
+    LogicalSide, ModEntry, ScreenView, SoundPlay, SoundRef, SoundSource, Text, TextFormError,
+    TriState,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Every phrase has an umlaut, so any one asked to type can be answered with it folded.
 const PHRASES: &str = r#"{
   "meta": {"name": "Testisch", "ui": {"correct": "Ja!", "wrong": "Nein!"}, "portrait": {"frames": 9}},
   "voices": ["v1"],
-  "speeds": ["normal"],
+  "speeds": ["normal", "slow"],
   "words": [
     {"key": "bloop", "kind": "block", "patterns": ["bloop"]},
     {"key": "quux", "kind": "item", "patterns": ["quux"]},
@@ -28,21 +34,22 @@ const PHRASES: &str = r#"{
     {"key": "zing", "kind": "block", "patterns": ["zing"]}
   ],
   "phrases": [
-    {"id": "break.bloop", "action": "break", "key": "bloop", "text": "Ich zerbreche den Bloop.", "en": "I break the bloop.",
-     "parts": [{"text": "Ich", "role": "pron"}, {"text": "zerbreche", "role": "verb"}, {"text": "den", "role": "part"}, {"text": "Bloop", "role": "obj"}]},
-    {"id": "place.bloop", "action": "place", "key": "bloop", "text": "Ich setze den Bloop.", "en": "I set the bloop."},
-    {"id": "pickup.bloop", "action": "pickup", "key": "bloop", "text": "Ich nehme den Bloop.", "en": "I take the bloop."},
-    {"id": "hold.bloop", "action": "hold", "key": "bloop", "text": "der Bloop", "en": "bloop"},
-    {"id": "hold.quux", "action": "hold", "key": "quux", "text": "das Quux", "en": "quux"},
-    {"id": "pickup.quux", "action": "pickup", "key": "quux", "text": "Ich nehme das Quux.", "en": "I take the quux."},
-    {"id": "break.zap", "action": "break", "key": "zap", "text": "Ich zerbreche den Zap.", "en": "I break the zap."},
-    {"id": "use.zing", "action": "use", "key": "zing", "text": "Ich benutze das Zing.", "en": "I use the zing."}
+    {"id": "break.bloop", "action": "break", "key": "bloop", "text": "Ich zerbreche den Blööp.", "en": "I break the bloop.",
+     "parts": [{"text": "Ich", "role": "pron"}, {"text": "zerbreche", "role": "verb"}, {"text": "den", "role": "part"}, {"text": "Blööp", "role": "obj"}]},
+    {"id": "place.bloop", "action": "place", "key": "bloop", "text": "Ich setze den Blööp.", "en": "I set the bloop."},
+    {"id": "pickup.bloop", "action": "pickup", "key": "bloop", "text": "Ich nehme den Blööp.", "en": "I take the bloop."},
+    {"id": "hold.bloop", "action": "hold", "key": "bloop", "text": "der Blööp", "en": "bloop"},
+    {"id": "hold.quux", "action": "hold", "key": "quux", "text": "das Quäx", "en": "quux"},
+    {"id": "pickup.quux", "action": "pickup", "key": "quux", "text": "Ich nehme das Quäx.", "en": "I take the quux."},
+    {"id": "break.zap", "action": "break", "key": "zap", "text": "Ich zerbreche den Zäp.", "en": "I break the zap."},
+    {"id": "use.zing", "action": "use", "key": "zing", "text": "Ich benütze das Zing.", "en": "I use the zing."},
+    {"id": "hungry", "action": "hungry", "text": "Ich möchte essen.", "en": "I want to eat."}
   ]
 }"#;
 
 const LIPSYNC: &str = r#"{"window": 40, "clips": {"v1.normal.hold.quux": "1221"}}"#;
 
-const IDS: [&str; 8] = [
+const IDS: [&str; 9] = [
     "break.bloop",
     "place.bloop",
     "pickup.bloop",
@@ -51,7 +58,9 @@ const IDS: [&str; 8] = [
     "pickup.quux",
     "break.zap",
     "use.zing",
+    "hungry",
 ];
+const SPEEDS: [&str; 2] = ["normal", "slow"];
 const START: i64 = 1_700_000_000_000;
 const BLOCK: [i32; 3] = [4, 64, 4];
 const ZAP: [i32; 3] = [5, 64, 4];
@@ -81,6 +90,8 @@ struct Session {
     unreadable: HashSet<(Store, String)>,
     /// What the next right click on a block reads as.
     click: Option<Click>,
+    /// The consequences the answers sent to the integrated server.
+    sent: Vec<Vec<ServerAction>>,
 }
 
 #[derive(Default)]
@@ -99,7 +110,12 @@ impl TestClient {
 
     /// How often the voice played this phrase.
     fn plays(&self, id: &str) -> usize {
-        let event = format!("zhnarrator_de:v1.normal.{id}");
+        self.plays_at("normal", id)
+    }
+
+    /// How often the voice played this phrase at this speed.
+    fn plays_at(&self, speed: &str, id: &str) -> usize {
+        let event = format!("zhnarrator_de:v1.{speed}.{id}");
         self.session()
             .played
             .iter()
@@ -129,10 +145,15 @@ impl TestClient {
     }
 }
 
-/// A component's characters, translation keys standing for their text.
+/// A component's characters, translation keys standing for their text, with their arguments as
+/// `key[a|b]`.
 fn plain(text: &Text) -> String {
     let mut out = match &text.content {
         TextContent::Literal(literal) => literal.clone(),
+        TextContent::Translatable { key, arguments, .. } if !arguments.is_empty() => {
+            let arguments: Vec<String> = arguments.iter().map(plain).collect();
+            format!("{key}[{}]", arguments.join("|"))
+        }
         TextContent::Translatable { key, .. } => key.clone(),
         _ => String::new(),
     };
@@ -212,8 +233,9 @@ impl Client for TestClient {
         }
     }
     fn sound_events(&self, _: &dyn ClientHost) -> HashSet<String> {
-        IDS.iter()
-            .map(|id| format!("zhnarrator_de:v1.normal.{id}"))
+        SPEEDS
+            .iter()
+            .flat_map(|speed| IDS.map(|id| format!("zhnarrator_de:v1.{speed}.{id}")))
             .collect()
     }
     fn item_ids(&self, _: &dyn ClientHost) -> Vec<String> {
@@ -244,20 +266,72 @@ impl Client for TestClient {
             .insert((store, name.to_string()), bytes.to_vec());
         Ok(())
     }
+    fn millis(&self, _: &dyn ClientHost) -> u64 {
+        self.session().now as u64
+    }
+    fn clipboard(&self, _: &dyn ClientHost) -> Option<String> {
+        None
+    }
+    fn set_clipboard(&self, _: &dyn ClientHost, _: &str) -> bool {
+        false
+    }
+    fn send_consequences(&self, _: &mut dyn ClientHost, actions: &[ServerAction]) -> bool {
+        self.session().sent.push(actions.to_vec());
+        true
+    }
+    fn struck(&self, _: &dyn ClientHost, _: EntityRef) -> Option<Struck> {
+        None
+    }
+    fn used_item(&self, _: &dyn ClientHost, _: Option<&ItemStack>) -> (String, bool) {
+        (String::new(), false)
+    }
+    fn entity_fates(&self, _: &dyn ClientHost, _: &[u64]) -> Vec<(u64, Fate)> {
+        Vec::new()
+    }
+    fn projectile_hits(&self, _: &dyn ClientHost) -> Vec<(u64, String)> {
+        Vec::new()
+    }
 }
 
 /// Records what the HUD and the screen draw.
 #[derive(Default)]
 struct Canvas {
+    /// The GUI's size, when not 480 by 270.
+    size: Option<[f32; 2]>,
     texts: Vec<String>,
     sprites: Vec<String>,
     /// Each button's label and rectangle.
     buttons: Vec<(String, [f32; 4])>,
+    /// Each text field's text and rectangle.
+    fields: Vec<(String, [f32; 4])>,
+}
+
+impl Canvas {
+    fn sized(size: [f32; 2]) -> Canvas {
+        Canvas {
+            size: Some(size),
+            ..Canvas::default()
+        }
+    }
+
+    /// The rectangle of the button whose label holds `part`.
+    fn button(&self, part: &str) -> [f32; 4] {
+        let found = self.buttons.iter().find(|(label, _)| label.contains(part));
+        found
+            .unwrap_or_else(|| panic!("no {part} in {:?}", self.buttons))
+            .1
+    }
 }
 
 impl DrawContext for Canvas {
     fn size(&self) -> [f32; 2] {
-        [480.0, 270.0]
+        self.size.unwrap_or([480.0, 270.0])
+    }
+    fn draw_menu_background(&mut self, _: [f32; 4], _: bool) {}
+    fn gui_nine_slice(&mut self, _: &str, _: [f32; 4], _: u32) {}
+    fn widget_text_field(&mut self, field: &TextFieldView) -> TextFieldLayout {
+        self.fields.push((field.value.clone(), field.rect));
+        TextFieldLayout::new(field.scroll, Vec::new())
     }
     fn fill(&mut self, _: [f32; 4], _: u32) {}
     fn fill_gradient(&mut self, _: [f32; 4], _: u32, _: u32) {}
@@ -383,6 +457,44 @@ fn press(host: &FakeHost, screen: &ScreenView<'_>, key: &str) -> bool {
     cancelled
 }
 
+/// A character typed at the screen; whether a widget took it.
+fn type_char(host: &FakeHost, screen: &ScreenView<'_>, c: char) -> bool {
+    let (mut field, mut cancelled) = (None, false);
+    mod_api::dispatch_screen_char_typed_pre(host, screen, c, 0, &mut field, &mut cancelled);
+    cancelled
+}
+
+/// A left click at the centre of `rect`; whether the screen took it.
+fn click_at(host: &FakeHost, [x, y, w, h]: [f32; 4]) -> bool {
+    let mut cancelled = false;
+    let at = screen_at([x + w / 2.0, y + h / 2.0]);
+    mod_api::dispatch_screen_mouse_button_pressed_pre(host, &at, 0, 0, &mut cancelled);
+    cancelled
+}
+
+/// What the typed question's box holds, as the teacher keeps it.
+fn kept_typed() -> String {
+    with_state(|teacher, _| {
+        let open = teacher.and_then(|t| t.question().cloned());
+        open.map_or_else(String::new, |open| open.typed().to_string())
+    })
+}
+
+/// The open question's kind and its text.
+fn question_text() -> (QuestionKind, String) {
+    with_state(|teacher, _| {
+        let open = teacher
+            .and_then(|t| t.question().cloned())
+            .expect("a question");
+        (open.kind, open.question.text)
+    })
+}
+
+/// The settings page showing, if one is.
+fn settings_page() -> Option<Page> {
+    with_state(|_, game| game.settings.as_ref().map(|page| page.page()))
+}
+
 #[test]
 fn hooks_drive_the_teacher() {
     let io = Arc::new(TestClient::default());
@@ -407,8 +519,10 @@ fn hooks_drive_the_teacher() {
         tick(&mut host, &io, 50);
         let phrases = with_state(|teacher, _| teacher.map(|t| t.pack.phrases().len()));
         assert_eq!(phrases, Some(IDS.len()));
-        let n = IDS.len();
-        let line = format!("zhnarrator_de: {n} phrases loaded, {n} of {n} sound events resolved");
+        let (n, events) = (IDS.len(), IDS.len() * SPEEDS.len());
+        let line = format!(
+            "zhnarrator_de: {n} phrases loaded, {events} of {events} sound events resolved"
+        );
         let lines = take_log_lines();
         assert!(lines.contains(&(false, line)), "{lines:?}");
         let config = io
@@ -427,6 +541,7 @@ fn hooks_drive_the_teacher() {
             held_item: "minecraft:bloop".into(),
             held_count: 1,
             health: 20.0,
+            food: 20,
             on_ground: true,
             ..View::default()
         });
@@ -446,7 +561,7 @@ fn hooks_drive_the_teacher() {
         let mut canvas = Canvas::default();
         mod_api::dispatch_gui_layer_draw(&host, LAYER, &mut canvas);
         assert!(
-            canvas.texts.iter().any(|t| t == "das Quux"),
+            canvas.texts.iter().any(|t| t == "das Quäx"),
             "{:?}",
             canvas.texts
         );
@@ -506,8 +621,9 @@ fn hooks_drive_the_teacher() {
         tick(&mut host, &io, 100);
         assert!(io.said("break.bloop"));
 
-        // Placing: a click the pack has a use phrase for places nothing, a block that has not
-        // shown up within 500 ms is given up, and one that shows up in front of the face is said.
+        // Placing: a click the pack has a use phrase for says it and places nothing, a block that
+        // has not shown up within 500 ms is given up, and one that shows up in front of the face
+        // is said.
         let place = |target: &str| Click {
             main_hand: true,
             target: target.into(),
@@ -519,6 +635,7 @@ fn hooks_drive_the_teacher() {
         right_click(&mut host, &io, place("minecraft:zing"));
         io.session().blocks.insert(ABOVE, "minecraft:bloop".into());
         tick(&mut host, &io, 100);
+        assert!(io.said("use.zing"));
         io.session().blocks.remove(&ABOVE);
         right_click(&mut host, &io, place("minecraft:stone"));
         tick(&mut host, &io, 600);
@@ -614,6 +731,116 @@ fn hooks_drive_the_teacher() {
         let right = chat.iter().filter(|line| line.starts_with("Ja!")).count();
         assert_eq!(right, 2, "{chat:?}");
 
+        // Off single player the answers send nothing, and the game's log says why once for the
+        // world.
+        assert!(io.session().sent.is_empty());
+        let no_server = |lines: &[(bool, String)]| {
+            let line = (true, NO_SERVER_LINE.to_string());
+            lines.iter().filter(|seen| **seen == line).count()
+        };
+        assert_eq!(no_server(&take_log_lines()), 1);
+
+        // K: the config and chat say the slow speed, and the next clip plays its sound event.
+        io.update(|view| view.paused = false);
+        io.session().clicks.push(keys::SPEED);
+        tick(&mut host, &io, 50);
+        let config = io.file(Store::Config, files::CONFIG_FILE);
+        assert_eq!(
+            config.expect("config written")["speed"],
+            Value::from("slow")
+        );
+        let chat = io.session().chat.clone();
+        let speed = "learnordie.notice.speed[learnordie.value.slow]".to_string();
+        assert!(chat.contains(&speed), "{chat:?}");
+        io.update(|view| view.held_item = "minecraft:bloop".into());
+        for _ in 0..10 {
+            tick(&mut host, &io, 100);
+        }
+        assert_eq!(io.plays_at("slow", "hold.bloop"), 1);
+        io.session().clicks.push(keys::SPEED);
+        tick(&mut host, &io, 50);
+
+        // Hunger, a fact of the tick: a food level of 6 or less is said once.
+        io.update(|view| view.food = 5);
+        for _ in 0..10 {
+            tick(&mut host, &io, 100);
+        }
+        assert_eq!(io.plays("hungry"), 1);
+        io.update(|view| view.food = 20);
+
+        // I opens the settings' main page, which pauses as an options screen does, every button
+        // on screen in a 350 by 405 window. A click on Questions moves it on to typed questions,
+        // saved at once. The page button opens the advanced page; Esc goes back, and on the main
+        // page lets Escape close the screen.
+        io.session().clicks.push(keys::SETTINGS);
+        tick(&mut host, &io, 50);
+        assert!(io.session().screen);
+        assert_eq!(settings_page(), Some(Page::Main));
+        tick(&mut host, &io, 50);
+        assert!(quiz_pauses());
+        let mut canvas = Canvas::sized([350.0, 405.0]);
+        mod_api::dispatch_screen_render_post(&host, &mut canvas, &screen);
+        for (label, [x, y, w, h]) in &canvas.buttons {
+            let on_screen = *x >= 0.0 && *y >= 0.0 && x + w <= 350.0 && y + h <= 405.0;
+            assert!(on_screen, "{label} at {:?}", [x, y, w, h]);
+        }
+        assert!(click_at(&host, canvas.button("options.quiz_mode")));
+        let config = io.file(Store::Config, files::CONFIG_FILE);
+        assert_eq!(
+            config.expect("config written")["quizMode"],
+            Value::from("typing")
+        );
+        assert!(click_at(&host, canvas.button("options.advanced")));
+        assert_eq!(settings_page(), Some(Page::Advanced));
+        assert!(press(&host, &screen, "key.keyboard.escape"));
+        assert_eq!(settings_page(), Some(Page::Main));
+        assert!(!press(&host, &screen, "key.keyboard.escape"));
+        io.session().screen = false;
+        tick(&mut host, &io, 50);
+        assert_eq!(settings_page(), None);
+
+        // So the next question is one to type, pausing as a choice does. For 400 ms the box
+        // takes nothing, Enter included. Then it takes ä, and the answer typed with its umlauts
+        // folded is close enough: right, with the spelling note in chat.
+        next_question(&mut host, &io);
+        let (kind, text) = question_text();
+        assert_eq!(kind, QuestionKind::Typing);
+        assert!(quiz_pauses());
+        let mut canvas = Canvas::default();
+        mod_api::dispatch_screen_render_post(&host, &mut canvas, &screen);
+        assert_eq!(canvas.fields.len(), 1, "{:?}", canvas.fields);
+        assert!(type_char(&host, &screen, 'x'));
+        assert!(press(&host, &screen, "key.keyboard.enter"));
+        assert_eq!(kept_typed(), "");
+        io.update(|view| view.paused = true);
+        tick(&mut host, &io, 500);
+        assert!(io.session().screen);
+        assert!(type_char(&host, &screen, 'ä'));
+        assert_eq!(kept_typed(), "ä");
+        assert!(press(&host, &screen, "key.keyboard.backspace"));
+        let folded: String = text
+            .chars()
+            .map(|c| match c {
+                'ä' => 'a',
+                'ö' => 'o',
+                'ü' => 'u',
+                c => c,
+            })
+            .collect();
+        assert_ne!(folded, text);
+        for c in folded.chars() {
+            assert!(type_char(&host, &screen, c));
+        }
+        assert_eq!(kept_typed(), folded);
+        assert!(press(&host, &screen, "key.keyboard.enter"));
+        tick(&mut host, &io, 50);
+        assert!(!io.session().screen);
+        let chat = io.session().chat.clone();
+        let close = format!("learnordie.quiz.typed_close[{folded}]");
+        assert!(chat.contains(&close), "{chat:?}");
+        let right = chat.iter().filter(|line| line.starts_with("Ja!")).count();
+        assert_eq!(right, 3, "{chat:?}");
+
         // Single player: the progress is filed under the save folder and the integrated server's
         // seed; with no seed within 5 s, under seed 0.
         let solo = |level| View {
@@ -621,6 +848,7 @@ fn hooks_drive_the_teacher() {
             singleplayer: true,
             save_folder: Some("Testwelt".into()),
             health: 20.0,
+            food: 20,
             on_ground: true,
             ..View::default()
         };
@@ -638,6 +866,38 @@ fn hooks_drive_the_teacher() {
         assert!(!filed("save:Testwelt:0"), "a join waits for the seed");
         tick(&mut host, &io, 5000);
         assert!(filed("save:Testwelt:0"));
+
+        // There, a wrong answer sends its consequences (the default penalty, two effects) to
+        // the integrated server, and chat says back what was typed. Check submits too.
+        io.update(|view| {
+            view.held_item = "minecraft:quux".into();
+            view.held_count = 1;
+        });
+        next_question(&mut host, &io);
+        assert_eq!(question_text().0, QuestionKind::Typing);
+        io.update(|view| view.paused = true);
+        tick(&mut host, &io, 500);
+        let mut canvas = Canvas::default();
+        mod_api::dispatch_screen_render_post(&host, &mut canvas, &screen);
+        for c in "falsch".chars() {
+            assert!(type_char(&host, &screen, c));
+        }
+        assert!(click_at(&host, canvas.button("learnordie.quiz.check")));
+        tick(&mut host, &io, 50);
+        let sent = io.session().sent.clone();
+        let effects = |actions: &[ServerAction]| {
+            actions.len() == 2 && actions.iter().all(|a| matches!(a, ServerAction::Effect(_)))
+        };
+        assert!(sent.len() == 1 && effects(&sent[0]), "{sent:?}");
+        let chat = io.session().chat.clone();
+        assert!(
+            chat.contains(&"learnordie.quiz.typed[falsch]".to_string()),
+            "{chat:?}"
+        );
+        assert!(
+            chat.iter().any(|line| line.starts_with("Nein!")),
+            "{chat:?}"
+        );
 
         // The toggle key turns him off, says so in chat, and the config file keeps it.
         io.session().clicks.push(keys::TOGGLE);

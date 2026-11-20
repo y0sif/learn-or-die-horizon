@@ -9,11 +9,14 @@
 //! The client hooks act only for this window's own game: a split-screen player's game, in this
 //! process too, would otherwise drive the same teacher with its own player (`game::hosting`).
 use mod_api::{
-    AddClientReloadListenersEvent, ClientHost, ClientPlayerLoggingOutEvent, ClientTickPostEvent,
-    Flow, GuiLayerDrawEvent, Hooks, HostSide, InteractionKeyMappingTriggeredEvent, LogicalSide,
-    RegisterGuiLayersEvent, Registrar, RegistrationContext, RightClickBlockEvent,
-    ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenRenderPostEvent, ServerHost,
-    ServerStartedEvent, ServerStoppedEvent,
+    AddClientReloadListenersEvent, ClientAttackTargetEvent, ClientHost,
+    ClientPlayerLoggingOutEvent, ClientTickPostEvent, EntityInteractEvent, Flow, GuiDraw,
+    GuiLayerDrawEvent, Hand, HealthHudEvent, Hooks, HostSide, InteractionKeyMappingTriggeredEvent,
+    InteractionResult, LogicalSide, RegisterGuiLayersEvent, Registrar, RegistrationContext,
+    RenderLivingPreEvent, RightClickBlockEvent, ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent,
+    ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
+    ScreenMouseDraggedPreEvent, ScreenRenderPostEvent, ServerHost, ServerStartedEvent,
+    ServerStoppedEvent,
 };
 
 pub mod core;
@@ -95,6 +98,61 @@ impl Hooks for Mod {
         Flow::Continue
     }
 
+    /// The attack key hits the crosshair's entity (the first target): `hit.<entity>`, and a
+    /// living one is watched for the kill.
+    fn client_attack_target(
+        &self,
+        host: &mut dyn ClientHost,
+        event: &mut ClientAttackTargetEvent<'_>,
+    ) -> Flow {
+        if let Some(&target) = event.targets.first()
+            && game::hosting()
+        {
+            game::detect::attacked(&*host, target);
+        }
+        Flow::Continue
+    }
+
+    /// The client's half of a right click on an entity, main hand: `feed.<entity>`.
+    fn entity_interact(
+        &self,
+        host: HostSide,
+        event: &mut EntityInteractEvent<'_>,
+    ) -> Option<InteractionResult> {
+        if let HostSide::Client(host) = host
+            && event.hand == Hand::Main
+            && game::hosting()
+        {
+            game::detect::entity_used(&*host, event.kind, event.stack);
+        }
+        None
+    }
+
+    /// Every living entity drawn: one hurt or dying is kept for the tick (a client reads no
+    /// health of another entity). Gated on `hosting` inside, after the two comparisons that
+    /// let almost every entity through untouched.
+    fn render_living_pre(
+        &self,
+        _host: &dyn ClientHost,
+        event: &mut RenderLivingPreEvent<'_>,
+    ) -> Flow {
+        game::detect::drawn(event.entity);
+        Flow::Continue
+    }
+
+    /// The health bar's inputs tell whether the world is a Hardcore one. Horizon draws its own
+    /// bar.
+    fn health_hud(
+        &self,
+        _host: &mut dyn ClientHost,
+        event: &mut HealthHudEvent<'_>,
+    ) -> Option<Vec<GuiDraw>> {
+        if game::hosting() {
+            game::detect::set_hardcore(event.inputs.hardcore);
+        }
+        None
+    }
+
     fn gui_layer_draw(&self, host: &dyn ClientHost, event: &mut GuiLayerDrawEvent<'_>) {
         if game::hosting() {
             game::hud::draw(host, event);
@@ -127,5 +185,38 @@ impl Hooks for Mod {
             return Flow::Continue;
         }
         game::screen::key_pressed(host, event)
+    }
+
+    fn screen_char_typed_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenCharTypedPreEvent<'_>,
+    ) -> Flow {
+        if !game::hosting() {
+            return Flow::Continue;
+        }
+        game::screen::char_typed(host, event)
+    }
+
+    fn screen_mouse_button_released_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenMouseButtonReleasedPreEvent<'_>,
+    ) -> Flow {
+        if !game::hosting() {
+            return Flow::Continue;
+        }
+        game::screen::mouse_released(host, event)
+    }
+
+    fn screen_mouse_dragged_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenMouseDraggedPreEvent<'_>,
+    ) -> Flow {
+        if !game::hosting() {
+            return Flow::Continue;
+        }
+        game::screen::mouse_dragged(host, event)
     }
 }

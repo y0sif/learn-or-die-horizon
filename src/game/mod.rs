@@ -20,12 +20,14 @@ pub(crate) mod loading;
 pub(crate) mod payload;
 pub(crate) mod screen;
 pub(crate) mod server;
+pub(crate) mod settings;
 mod sound;
 #[cfg(test)]
 mod tests;
+pub(crate) mod typing;
 pub(crate) mod world;
 
-use crate::core::{Outcome, Pictures, QuizEvent, Teacher};
+use crate::core::{Outcome, Pictures, QuizEvent, Teacher, Verdict, Wipe};
 use client::{Client, HostClient, View};
 use mod_api::{ClientHost, SoundRef, Text};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,8 +35,9 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 pub const MOD_ID: &str = "learnordie";
 
-/// True while the question screen is up and the config pauses for it (`quizPauseGame`); the
-/// `quiz_pause` mixin adds it to `Game::pauses_game`, which pauses single player only.
+/// True while this mod's screen asks to pause: the question screen with `quizPauseGame` on, or the
+/// settings pages (options screens pause); the `quiz_pause` mixin adds it to
+/// `Game::pauses_game`, which pauses single player only.
 static QUIZ_PAUSES: AtomicBool = AtomicBool::new(false);
 /// Esc has just suspended the question: the `quiz_escape` mixin opens the pause menu once Escape
 /// has closed the screen, as the original's `onClose` does. Cleared every client tick.
@@ -142,6 +145,14 @@ pub(crate) struct Game {
     picture: Option<(String, Option<String>)>,
     /// The question screen's size when last drawn, for its clicks.
     screen_size: [f32; 2],
+    /// The typed question's edit box and buttons, while one shows.
+    typing: Option<typing::Typing>,
+    /// The settings page this mod's screen shows instead of a question.
+    settings: Option<settings::Settings>,
+    /// The world key of the world joined.
+    world_key: Option<String>,
+    /// The world the "no consequences" line was logged for.
+    warned_world: Option<String>,
 }
 
 pub(crate) struct State {
@@ -178,10 +189,16 @@ fn question_up(teacher: &Teacher) -> bool {
     teacher.question().is_some_and(|open| !open.is_suspended())
 }
 
-/// One client tick (Java `ZhNarratorClient.tick`, the pilot's parts): the pack after a reload,
-/// the keys, the level, the detector and the quiz while the game runs, the question's clock, the
-/// speaker, the progress file, then what the answers left to do.
+/// One client tick, then what the game drew since the last one is forgotten.
 pub(crate) fn client_tick(host: &mut dyn ClientHost) {
+    tick(host);
+    detect::end_tick();
+}
+
+/// One client tick (Java `ZhNarratorClient.tick`): the pack after a reload, the settings page,
+/// the keys, the level, the detector and the quiz while the game runs, the question's clock,
+/// the speaker, the progress file, then what the answers left to do.
+fn tick(host: &mut dyn ClientHost) {
     ESCAPE_PAUSE.store(false, Ordering::Relaxed);
     let io = io();
     let io = &*io;
@@ -193,12 +210,18 @@ pub(crate) fn client_tick(host: &mut dyn ClientHost) {
         QUIZ_PAUSES.store(false, Ordering::Relaxed);
         return;
     };
-    let Some(view) = io.view(&*host) else {
+    let Some(mut view) = io.view(&*host) else {
         leave(&*host, io, teacher, game, now);
         QUIZ_PAUSES.store(false, Ordering::Relaxed);
         return;
     };
-    keys::handle(host, io, teacher, now);
+    settings::tick(host, io, game, &view);
+    keys::handle(host, io, teacher, game, now);
+    if game.settings.is_some() {
+        // The settings page is up: a screen is open, and it is not the question's.
+        view.screen_open = true;
+        view.our_screen = false;
+    }
     let mut opened = false;
     if join(teacher, game, &view, now) && !view.paused {
         opened = world_tick(host, io, teacher, game, &view, now);
@@ -220,8 +243,12 @@ pub(crate) fn client_tick(host: &mut dyn ClientHost) {
         files::save_progress(&*host, io, &mut teacher.progress, language, now);
     }
     finish_answers(host, io, teacher, game, view.our_screen);
+    if !question_up(teacher) {
+        game.typing = None;
+    }
     let up = question_up(teacher) && (view.our_screen || opened);
-    QUIZ_PAUSES.store(up && teacher.config.quiz_pause_game, Ordering::Relaxed);
+    let pauses = (up && teacher.config.quiz_pause_game) || game.settings.is_some();
+    QUIZ_PAUSES.store(pauses, Ordering::Relaxed);
 }
 
 /// The client is about to disconnect: the progress is saved.
@@ -263,6 +290,7 @@ fn reload(
             game.attacked.clear();
             game.pending_place = None;
             game.picture = None;
+            game.typing = None;
         }
         Err(e) => log_warn(format!("the teacher stays away: {e}")),
     }
@@ -283,6 +311,10 @@ fn leave(host: &dyn ClientHost, io: &dyn Client, teacher: &mut Teacher, game: &m
     game.pending_place = None;
     game.outcomes.clear();
     game.picture = None;
+    game.typing = None;
+    game.settings = None;
+    game.world_key = None;
+    detect::set_hardcore(false);
 }
 
 /// The level object changed (a world joined, another dimension, a respawn into a new level):
@@ -302,6 +334,7 @@ fn join(teacher: &mut Teacher, game: &mut Game, view: &View, now: i64) -> bool {
     game.attacked.clear();
     game.pending_place = None;
     teacher.joined_level(now, &key, &view.dimension, &view.held_item);
+    game.world_key = Some(key);
     true
 }
 
@@ -327,7 +360,10 @@ fn world_tick(
             .collect()
     });
     let breaking = detect::mining(game.target.as_ref());
-    let input = detect::world_tick(view, inventory.as_deref(), breaking, now);
+    let fates = detect::fates(&*host, io, teacher);
+    let hits = detect::hits(&*host, io, teacher);
+    let hits: Vec<(u64, &str)> = hits.iter().map(|(id, kind)| (*id, kind.as_str())).collect();
+    let input = detect::world_tick(view, inventory.as_deref(), breaking, &hits, &fates, now);
     let event = teacher.world_tick(&input);
     match event {
         Some(QuizEvent::Ask) => {
@@ -359,11 +395,21 @@ fn open_question(
             .map(str::to_string);
         game.picture = Some((id.clone(), item));
     }
+    // A typed question's box is made for it when its screen first draws: empty for a new
+    // question, with the kept text for one coming back.
+    game.typing = None;
     io.open_screen(host)
 }
 
-/// The answers' chat lines (Java `QuizManager.answer`), and the question screen closed once it
-/// has nothing left to show.
+/// What the original logs when an answer has no integrated server to act on, once per world
+/// here (the original logs it at every answer).
+pub(crate) const NO_SERVER_LINE: &str =
+    "answers bring no rewards or penalties here: they work in single player only";
+
+/// What the answers left to do (Java `QuizManager.answerTyped` and `answer`): the chat lines in
+/// the original's order (what was typed, a learned phrase, the angry teacher, the verdict), the
+/// consequences sent to the integrated server, and the question screen closed once it has
+/// nothing left to show.
 fn finish_answers(
     host: &mut dyn ClientHost,
     io: &dyn Client,
@@ -372,14 +418,73 @@ fn finish_answers(
     our_screen: bool,
 ) {
     for outcome in std::mem::take(&mut game.outcomes) {
+        if let Some(line) = typed_line(&outcome) {
+            io.chat(host, line);
+        }
         if outcome.learned {
             io.chat(host, learned(&outcome));
         }
+        if let Some(wipe) = outcome.angry {
+            io.chat(host, angry(teacher, wipe));
+        }
         io.chat(host, verdict(teacher, &outcome));
+        match &outcome.server {
+            Some(actions) => {
+                io.send_consequences(host, actions);
+            }
+            None => {
+                if game.warned_world != game.world_key {
+                    game.warned_world = game.world_key.clone();
+                    log_warn(NO_SERVER_LINE.into());
+                }
+            }
+        }
     }
     if our_screen && !question_up(teacher) {
         io.close_screen(host);
     }
+}
+
+/// `§7`, the grey of the original's side notes.
+const GREY: u32 = 0xAA_AAAA;
+/// `§c`.
+const RED: u32 = 0xFF_5555;
+
+/// A typed answer that was not exact, said back in grey: nothing typed, close enough with a
+/// spelling note, or wrong.
+fn typed_line(outcome: &Outcome) -> Option<Text> {
+    let typed = outcome
+        .typed
+        .as_ref()
+        .filter(|t| t.verdict != Verdict::Exact)?;
+    let key = if typed.text.trim().is_empty() {
+        "learnordie.quiz.typed_nothing"
+    } else if typed.verdict == Verdict::Close {
+        "learnordie.quiz.typed_close"
+    } else {
+        "learnordie.quiz.typed"
+    };
+    let mut line = Text::translate(key, vec![Text::literal(typed.text.clone())]);
+    line.style.color = Some(format!("#{GREY:06X}"));
+    Some(line)
+}
+
+/// The angry teacher's line: his angry phrase in red, then what he did in grey (said even with no
+/// integrated server to do it, as the original).
+fn angry(teacher: &Teacher, wipe: Wipe) -> Text {
+    let phrase = teacher
+        .pack
+        .phrase("angry")
+        .map_or_else(String::new, |p| p.text.clone());
+    let key = match wipe {
+        Wipe::Drop => "learnordie.angry.drop",
+        Wipe::Delete => "learnordie.angry.delete",
+    };
+    let mut what = Text::translate(key, vec![]);
+    what.style.color = Some(format!("#{GREY:06X}"));
+    Text::literal("")
+        .append(screen::coloured(format!("{phrase} "), RED))
+        .append(what)
 }
 
 /// `Richtig! ✓ <text>  (<translation>)`, green, or the wrong one in red.

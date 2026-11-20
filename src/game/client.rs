@@ -1,11 +1,17 @@
 //! The seam between the game layer and the client host: every client read and write the layer
 //! makes goes through [`Client`]. [`HostClient`] answers from the game; the wiring test installs
 //! its own, because the SDK's fake host has no client backend and panics on client calls.
-use super::MOD_ID;
+//!
+//! The SDK's widgets (the typed question's edit box, the settings buttons) ask their host for
+//! the game's clock, the clipboard and the click sound: [`WidgetHost`] answers those through the
+//! seam too.
+use super::{MOD_ID, detect};
+use crate::core::{Fate, ServerAction};
+use mod_api::prelude::{ClientInputClientHost, EffectsClientHost};
 use mod_api::{
     BlockBreakingState, BlockClick, ClientHost, ConfigFileError, ConfigFiles, ConfigPath,
-    CrosshairTarget, EntityRef, EquipmentSlot, Hand, Identifier, PackType, SoundPlay, SoundRef,
-    SoundState, Text,
+    CrosshairTarget, EntityRef, EquipmentSlot, Hand, Host, Identifier, ItemStack, LevelRef,
+    PackType, SoundPlay, SoundRef, SoundState, Text,
 };
 use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -60,6 +66,51 @@ pub struct View {
     pub position: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    /// A Hardcore world, as the health bar last drew it (no other read tells a client).
+    pub hardcore: bool,
+    /// The food level, 0 to 20.
+    pub food: i32,
+    /// The vehicle's entity type id.
+    pub vehicle: Option<String>,
+    /// Creative flight.
+    pub flying: bool,
+    pub on_climbable: bool,
+    pub sprinting: bool,
+    pub sneaking: bool,
+    /// On fire, or in lava.
+    pub on_fire: bool,
+    /// A fishing rod in hand and a bobber out near the player.
+    pub fishing: bool,
+    /// The item in use, when it is food or a consumable.
+    pub eating: Option<String>,
+    /// A movement key, the jump key, the drop key is down.
+    pub move_keys: bool,
+    pub jump_key: bool,
+    pub drop_key: bool,
+    /// Blocks per tick.
+    pub velocity: [f64; 3],
+    /// `isDarkOutside`, `isRaining`, `isThundering`.
+    pub dark: bool,
+    pub raining: bool,
+    pub thundering: bool,
+    /// The biome at the player has precipitation, is cold enough to snow there, and its base
+    /// temperature.
+    pub biome_rains: bool,
+    pub biome_snows: bool,
+    pub biome_temperature: f32,
+}
+
+/// The entity an attack hit, as the teacher reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Struck {
+    /// Its network id.
+    pub id: u64,
+    /// Its entity type id.
+    pub kind: String,
+    /// A living entity (a mob, a player, an armour stand).
+    pub living: bool,
+    /// It is dying already.
+    pub dying: bool,
 }
 
 /// A right click on a block, as the place check reads it.
@@ -125,6 +176,129 @@ pub trait Client: Send + Sync {
         name: &str,
         bytes: &[u8],
     ) -> Result<(), String>;
+    /// The game's own clock in ms, which the widgets' caret and double clicks run by.
+    fn millis(&self, host: &dyn ClientHost) -> u64;
+    fn clipboard(&self, host: &dyn ClientHost) -> Option<String>;
+    fn set_clipboard(&self, host: &dyn ClientHost, text: &str) -> bool;
+    /// Sends an answer's consequences to the integrated server; true when queued.
+    fn send_consequences(&self, host: &mut dyn ClientHost, actions: &[ServerAction]) -> bool;
+    /// The entity an attack acts on.
+    fn struck(&self, host: &dyn ClientHost, entity: EntityRef) -> Option<Struck>;
+    /// The item of a right click on an entity, empty for an empty hand, and whether it is food.
+    fn used_item(&self, host: &dyn ClientHost, stack: Option<&ItemStack>) -> (String, bool);
+    /// Of the entities `watched` (network ids), those dying now or gone.
+    fn entity_fates(&self, host: &dyn ClientHost, watched: &[u64]) -> Vec<(u64, Fate)>;
+    /// Living entities, not the player, hurt this tick within 3 blocks of a projectile a player
+    /// throws or shoots: `(network id, entity type id)`.
+    fn projectile_hits(&self, host: &dyn ClientHost) -> Vec<(u64, String)>;
+}
+
+/// The host the SDK's widgets run with: their clock, the clipboard and the button click go
+/// through the seam. They ask nothing else of it.
+pub(crate) struct WidgetHost<'a> {
+    pub(crate) io: &'a dyn Client,
+    pub(crate) host: &'a dyn ClientHost,
+}
+
+impl Host for WidgetHost<'_> {}
+mod_api::impl_host_areas!(WidgetHost<'_>);
+impl ClientHost for WidgetHost<'_> {}
+mod_api::impl_client_host_areas!(WidgetHost<'_>, except(client_input, effects));
+
+impl ClientInputClientHost for WidgetHost<'_> {
+    fn millis(&self) -> u64 {
+        self.io.millis(self.host)
+    }
+    fn clipboard_text(&self) -> Option<String> {
+        self.io.clipboard(self.host)
+    }
+    fn set_clipboard_text(&self, text: &str) -> bool {
+        self.io.set_clipboard(self.host, text)
+    }
+}
+
+impl EffectsClientHost for WidgetHost<'_> {
+    fn play_local_sound(&self, sound: &SoundPlay, _after: u32) -> Option<SoundRef> {
+        self.io.play(self.host, sound)
+    }
+}
+
+/// Entity types that can be attacked but are not living (`LivingEntity`): vehicles, hanging
+/// things, crystals and the projectiles a hit deflects.
+fn is_living(kind: &str) -> bool {
+    let path = kind.rsplit(':').next().unwrap_or(kind);
+    !(path.ends_with("boat")
+        || path.ends_with("raft")
+        || path.contains("minecart")
+        || matches!(
+            path,
+            "item_frame"
+                | "glow_item_frame"
+                | "painting"
+                | "end_crystal"
+                | "leash_knot"
+                | "interaction"
+                | "fireball"
+                | "small_fireball"
+                | "dragon_fireball"
+                | "wither_skull"
+                | "shulker_bullet"
+                | "wind_charge"
+                | "breeze_wind_charge"
+        ))
+}
+
+/// The projectiles a player throws or shoots (Java's `Projectile` with the player as owner; a
+/// client cannot read the owner).
+fn is_players_projectile(kind: &str) -> bool {
+    matches!(
+        kind.rsplit(':').next().unwrap_or(kind),
+        "arrow"
+            | "spectral_arrow"
+            | "trident"
+            | "snowball"
+            | "egg"
+            | "ender_pearl"
+            | "potion"
+            | "splash_potion"
+            | "lingering_potion"
+            | "experience_bottle"
+            | "wind_charge"
+            | "firework_rocket"
+            | "fishing_bobber"
+    )
+}
+
+/// The sea level the snow line is reckoned from: a client cannot read it, and only the overworld,
+/// where it is 63, has biomes with precipitation.
+const SEA_LEVEL: i32 = 63;
+
+/// `Biome.coldEnoughToSnow` without its temperature noise: the base temperature, cooled above
+/// the sea level plus 17 by 0.05 every 40 blocks, below 0.15.
+fn snows(temperature: f32, y: i32) -> bool {
+    let above = y - (SEA_LEVEL + 17);
+    let at = if above > 0 {
+        temperature - above as f32 * 0.05 / 40.0
+    } else {
+        temperature
+    };
+    at < 0.15
+}
+
+/// The entity types in `level` within `radius` of `at`.
+fn kinds_near(host: &dyn ClientHost, level: LevelRef, at: [f64; 3], radius: f64) -> Vec<String> {
+    let min = at.map(|c| c - radius);
+    let max = at.map(|c| c + radius);
+    level
+        .entities_in(host, min, max)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entity| entity.kind(host).map(|key| key.id(host)))
+        .collect()
+}
+
+fn distance_sq(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a.iter().zip(b).map(|(p, q)| (p - q) * (p - q)).sum()
 }
 
 /// [`Client`] answered by the game.
@@ -200,11 +374,41 @@ impl Client for HostClient {
             _ => None,
         };
         let [yaw, pitch] = entity.rotation(host).unwrap_or([0.0; 2]);
-        let in_water = entity
-            .fluid_heights(host)
-            .unwrap_or_default()
-            .iter()
-            .any(|(fluid, height)| fluid.ends_with("water") && *height > 0.0);
+        let fluids = entity.fluid_heights(host).unwrap_or_default();
+        let in_fluid = |name: &str| {
+            fluids
+                .iter()
+                .any(|(fluid, height)| fluid.ends_with(name) && *height > 0.0)
+        };
+        let in_water = in_fluid("water");
+        let position = entity.position(host).unwrap_or([0.0; 3]);
+        let block = position.map(|c| c.floor() as i32);
+        let off_hand = living.and_then(|l| l.hand_item(host, Hand::Off));
+        let is_rod = |stack: &Option<ItemStack>| {
+            stack
+                .as_ref()
+                .is_some_and(|s| s.item().id(host) == "minecraft:fishing_rod")
+        };
+        let fishing = (is_rod(&held) || is_rod(&off_hand))
+            && kinds_near(host, level, position, 33.0)
+                .iter()
+                .any(|kind| kind == "minecraft:fishing_bobber");
+        let eating = host
+            .local_item_use()
+            .and_then(|using| living?.hand_item(host, using.hand))
+            .filter(|stack| {
+                ["minecraft:food", "minecraft:consumable"]
+                    .iter()
+                    .any(|c| host.item_default_component(stack.item(), c).is_some())
+            })
+            .map(|stack| stack.item().id(host));
+        let fixed_time = level
+            .dimension_type(host)
+            .is_some_and(|dimension| dimension.has_fixed_time);
+        let (rain, thunder) = level.weather(host).unwrap_or((0.0, 0.0));
+        let biome = level
+            .client_biome(host, block)
+            .and_then(|biome| level.biome_properties(host, &biome));
         Some(View {
             level: hasher.finish(),
             dimension: player
@@ -232,9 +436,36 @@ impl Client for HostClient {
             in_water,
             on_ground: entity.on_ground(host).unwrap_or(true),
             fall_flying: living.and_then(|l| l.is_gliding(host)).unwrap_or(false),
-            position: entity.position(host).unwrap_or([0.0; 3]),
+            position,
             yaw,
             pitch,
+            hardcore: detect::hardcore(),
+            food: player.food(host).map_or(20, |food| food.level),
+            vehicle: entity
+                .vehicle(host)
+                .and_then(|vehicle| vehicle.kind(host))
+                .map(|key| key.id(host)),
+            flying: player.abilities(host).is_some_and(|a| a.flying),
+            on_climbable: living.and_then(|l| l.is_climbing(host)).unwrap_or(false),
+            sprinting: entity.is_sprinting(host).unwrap_or(false),
+            sneaking: entity.is_shift_key_down(host).unwrap_or(false),
+            on_fire: entity.fire_ticks(host).unwrap_or(0) > 0 || in_fluid("lava"),
+            fishing,
+            eating,
+            move_keys: ["key.forward", "key.back", "key.left", "key.right"]
+                .into_iter()
+                .any(down),
+            jump_key: down("key.jump"),
+            drop_key: down("key.drop"),
+            velocity: entity.velocity(host).unwrap_or([0.0; 3]),
+            dark: !fixed_time && level.get_sky_darken(host).unwrap_or(0) >= 4,
+            raining: rain > 0.2,
+            thundering: thunder > 0.9,
+            biome_rains: biome.as_ref().is_some_and(|b| b.has_precipitation),
+            biome_snows: biome
+                .as_ref()
+                .is_some_and(|b| snows(b.temperature, block[1])),
+            biome_temperature: biome.as_ref().map_or(0.8, |b| b.temperature),
         })
     }
 
@@ -362,5 +593,91 @@ impl Client for HostClient {
         files(host, store)
             .write(&path, bytes)
             .map_err(|e| e.to_string())
+    }
+
+    fn millis(&self, host: &dyn ClientHost) -> u64 {
+        host.millis()
+    }
+
+    fn clipboard(&self, host: &dyn ClientHost) -> Option<String> {
+        host.clipboard_text()
+    }
+
+    fn set_clipboard(&self, host: &dyn ClientHost, text: &str) -> bool {
+        host.set_clipboard_text(text)
+    }
+
+    fn send_consequences(&self, host: &mut dyn ClientHost, actions: &[ServerAction]) -> bool {
+        super::payload::send_consequences(host, actions)
+    }
+
+    fn struck(&self, host: &dyn ClientHost, entity: EntityRef) -> Option<Struck> {
+        let kind = entity.kind(host)?.id(host);
+        Some(Struck {
+            id: u64::from(entity.id()),
+            living: is_living(&kind),
+            dying: detect::seen_dying(entity.id()),
+            kind,
+        })
+    }
+
+    fn used_item(&self, host: &dyn ClientHost, stack: Option<&ItemStack>) -> (String, bool) {
+        stack.map_or_else(
+            || (String::new(), false),
+            |stack| {
+                let food = host.item_default_component(stack.item(), "minecraft:food");
+                (stack.item().id(host), food.is_some())
+            },
+        )
+    }
+
+    /// Dying: drawn with a death time since the last tick (`render_living_pre`; a client keeps
+    /// no health of another entity). Gone: the client level no longer has it.
+    fn entity_fates(&self, host: &dyn ClientHost, watched: &[u64]) -> Vec<(u64, Fate)> {
+        watched
+            .iter()
+            .filter_map(|&id| {
+                let network = u32::try_from(id).ok()?;
+                if detect::seen_dying(network) {
+                    Some((id, Fate::Dying))
+                } else {
+                    host.entity(network)
+                        .is_none()
+                        .then_some((id, Fate::Removed))
+                }
+            })
+            .collect()
+    }
+
+    fn projectile_hits(&self, host: &dyn ClientHost) -> Vec<(u64, String)> {
+        let hurt = detect::seen_hurt();
+        let Some(player) = host.local_player().filter(|_| !hurt.is_empty()) else {
+            return Vec::new();
+        };
+        let (own, Some(level)) = (player.entity().id(), player.level(host)) else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        for (id, kind) in hurt {
+            let at = host.entity(id).and_then(|entity| entity.position(host));
+            let Some(at) = at.filter(|_| id != own) else {
+                continue;
+            };
+            let near = level
+                .entities_in(host, at.map(|c| c - 3.5), at.map(|c| c + 3.5))
+                .unwrap_or_default();
+            let shot = near.into_iter().any(|entity| {
+                entity
+                    .kind(host)
+                    .is_some_and(|key| is_players_projectile(&key.id(host)))
+                    && entity
+                        .position(host)
+                        .is_some_and(|p| distance_sq(p, at) < 9.0)
+            });
+            if shot {
+                hits.push((u64::from(id), kind));
+            }
+        }
+        hits
     }
 }

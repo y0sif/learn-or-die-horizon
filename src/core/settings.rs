@@ -366,6 +366,12 @@ impl Steps {
 }
 
 impl Setting {
+    /// The row is a slider (the original's `IntRange` and `UnitDouble` rows); switches and choices
+    /// are buttons that cycle.
+    pub fn is_slider(&self) -> bool {
+        matches!(self.kind, Kind::Number { .. })
+    }
+
     /// How many values the row has.
     pub fn positions(&self) -> usize {
         match &self.kind {

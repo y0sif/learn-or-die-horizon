@@ -1,18 +1,22 @@
-//! The question screen (Java `QuizScreen`), drawn on the mod's own screen: the item's picture,
-//! the English prompt (or a replay button for a listening question), the timer bar and four
-//! German options as buttons. Keys 1 to 4 and a click answer (both ignored for the first 700 ms);
-//! Esc suspends the question and the pause menu opens (the `quiz_escape` mixin), and it comes back
-//! with the time left once no screen is open.
+//! This mod's screen. It shows the open question, as four options (Java `QuizScreen`, here) or
+//! as an edit box ([`super::typing`]), or a settings page ([`super::settings`]); this module
+//! sends each screen hook to the one showing.
+//!
+//! The choice question: the item's picture, the English prompt (or a replay button for a
+//! listening question), the timer bar and four German options as buttons. Keys 1 to 4 and a
+//! click answer (both ignored for the first 700 ms); Esc suspends the question and the pause menu
+//! opens (the `quiz_escape` mixin), and it comes back with the time left once no screen is open.
 //!
 //! The input hooks' host only reads, so an answer is recorded here and the next client tick
 //! closes the screen and writes the chat line.
 use super::hud::{self, GOLD, frame, panel, width};
-use super::{ESCAPE_PAUSE, QUIZ_PAUSES, STATE, State, lock, sound};
-use crate::core::{OpenQuestion, Phrase, Teacher};
+use super::{ESCAPE_PAUSE, Game, QUIZ_PAUSES, STATE, State, lock, settings, sound, typing};
+use crate::core::{OpenQuestion, Phrase, QuestionKind, Teacher};
 use mod_api::client::hud_layout::PoseOp;
 use mod_api::{
-    ClientHost, DrawContext, Flow, GuiDraw, Identifier, ScreenKeyPressedPreEvent,
-    ScreenMouseButtonPressedPreEvent, ScreenRenderPostEvent, Text,
+    ClientHost, DrawContext, Flow, GuiDraw, Identifier, ScreenCharTypedPreEvent,
+    ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
+    ScreenMouseDraggedPreEvent, ScreenRenderPostEvent, Text,
 };
 use std::sync::atomic::Ordering;
 
@@ -23,11 +27,11 @@ const ROW_H: f32 = 44.0;
 /// Between the two columns.
 const GAP: f32 = 12.0;
 /// Inside the card's edges.
-const PAD: f32 = 16.0;
+pub(super) const PAD: f32 = 16.0;
 /// Kept between the card and the screen's edges.
-const EDGE: f32 = 4.0;
-const PROMPT: u32 = 0xFFFF_E08A;
-const GREY: u32 = 0xFFBB_BBBB;
+pub(super) const EDGE: f32 = 4.0;
+pub(super) const PROMPT: u32 = 0xFFFF_E08A;
+pub(super) const GREY: u32 = 0xFFBB_BBBB;
 const HURRY: u32 = 0xFFFF_7A7A;
 /// What the option text is brightened by (`NarratorHud.lift`, 0.35).
 const LIFT: f32 = 0.35;
@@ -74,7 +78,7 @@ impl Layout {
     }
 }
 
-fn inside([x, y]: [f32; 2], [rx, ry, rw, rh]: [f32; 4]) -> bool {
+pub(super) fn inside([x, y]: [f32; 2], [rx, ry, rw, rh]: [f32; 4]) -> bool {
     (rx..rx + rw).contains(&x) && (ry..ry + rh).contains(&y)
 }
 
@@ -105,7 +109,7 @@ fn label(teacher: &Teacher, index: usize, option: &Phrase) -> Text {
 
 /// A line of text `scale` times its size, centred on `at`, in one batch; scaled down further
 /// when it would be wider than `room`.
-fn centred_text(
+pub(super) fn centred_text(
     draw: &mut dyn DrawContext,
     text: &str,
     [x, y]: [f32; 2],
@@ -148,39 +152,18 @@ fn time_bar(draw: &mut dyn DrawContext, [x0, y, w]: [f32; 3], fraction: f32) {
 }
 
 /// The open question while this mod's screen may show it.
-fn showing(teacher: &Teacher) -> Option<&OpenQuestion> {
+pub(super) fn showing(teacher: &Teacher) -> Option<&OpenQuestion> {
     teacher.question().filter(|open| !open.is_suspended())
 }
 
-/// `extractRenderState`.
-pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
-    let io = super::io();
-    if !io.our_screen(host) {
-        return;
-    }
-    let now = io.now();
-    let mouse = event.screen.mouse;
-    let mut state = lock(&STATE);
-    let State { teacher, game } = &mut *state;
-    let Some(teacher) = teacher.as_ref() else {
-        return;
-    };
-    let Some(open) = showing(teacher) else {
-        return;
-    };
-    let draw = &mut *event.draw;
-    let size = draw.size();
-    game.screen_size = size;
-    let layout = Layout::new(size);
-    let [w, h] = size;
-    let (cx, mid) = (w / 2.0, (h / 2.0).floor());
-    draw.fill_gradient([0.0, 0.0, w, h], 0xC010_1010, 0xD010_1010);
-    let card_w = layout.card_w();
-    let room = card_w - PAD * 2.0;
-    let x0 = (cx - card_w / 2.0).round();
-    let bottom = layout.option(3)[1] + BUTTON_H + 10.0;
-    panel(draw, [x0, mid - 130.0, x0 + card_w, bottom], 255);
-
+/// The question's picture in its framed square at the card's top (`WordIcons.iconFor`).
+pub(super) fn picture(
+    draw: &mut dyn DrawContext,
+    host: &dyn ClientHost,
+    game: &Game,
+    open: &OpenQuestion,
+    [cx, mid]: [f32; 2],
+) {
     let picture = game
         .picture
         .as_ref()
@@ -194,6 +177,65 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
         frame(draw, [sx, sy, sx + 56.0, sy + 56.0], 0x40E6_B422);
         draw.item(item, [sx + 4.0, sy + 4.0], 48.0);
     }
+}
+
+/// The time bar under the prompt and the seconds left beside it, across the card from `x0`.
+pub(super) fn timer(
+    draw: &mut dyn DrawContext,
+    open: &OpenQuestion,
+    [x0, card_w, mid]: [f32; 3],
+    now: i64,
+) {
+    let left = open.left_ms(now);
+    let timer = format!("{:.0} s", left as f64 / 1000.0);
+    let bar_right = x0 + card_w - PAD - width(draw, &timer) - 6.0;
+    time_bar(
+        draw,
+        [x0 + PAD, mid - 20.0, bar_right - (x0 + PAD)],
+        open.fraction_left(now),
+    );
+    let colour = if left < 3000 { HURRY } else { GREY };
+    draw.text(&timer, [bar_right + 6.0, mid - 24.0], colour, true);
+}
+
+/// `extractRenderState` of the screen showing.
+pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
+    let io = super::io();
+    let io = &*io;
+    if !io.our_screen(host) {
+        return;
+    }
+    let now = io.now();
+    let mouse = event.screen.mouse;
+    let mut state = lock(&STATE);
+    let State { teacher, game } = &mut *state;
+    let Some(teacher) = teacher.as_ref() else {
+        return;
+    };
+    let draw = &mut *event.draw;
+    if game.settings.is_some() {
+        settings::render(host, io, draw, teacher, game, mouse);
+        return;
+    }
+    let Some(open) = showing(teacher) else {
+        return;
+    };
+    if open.kind == QuestionKind::Typing {
+        typing::render(host, io, draw, teacher, game, mouse, now);
+        return;
+    }
+    let size = draw.size();
+    game.screen_size = size;
+    let layout = Layout::new(size);
+    let [w, h] = size;
+    let (cx, mid) = (w / 2.0, (h / 2.0).floor());
+    draw.fill_gradient([0.0, 0.0, w, h], 0xC010_1010, 0xD010_1010);
+    let card_w = layout.card_w();
+    let room = card_w - PAD * 2.0;
+    let x0 = (cx - card_w / 2.0).round();
+    let bottom = layout.option(3)[1] + BUTTON_H + 10.0;
+    panel(draw, [x0, mid - 130.0, x0 + card_w, bottom], 255);
+    picture(draw, host, game, open, [cx, mid]);
 
     let title = if open.listening {
         "learnordie.quiz.listen"
@@ -216,16 +258,7 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
         );
     }
 
-    let left = open.left_ms(now);
-    let timer = format!("{:.0} s", left as f64 / 1000.0);
-    let bar_right = x0 + card_w - PAD - width(draw, &timer) - 6.0;
-    time_bar(
-        draw,
-        [x0 + PAD, mid - 20.0, bar_right - (x0 + PAD)],
-        open.fraction_left(now),
-    );
-    let colour = if left < 3000 { HURRY } else { GREY };
-    draw.text(&timer, [bar_right + 6.0, mid - 24.0], colour, true);
+    timer(draw, open, [x0, card_w, mid], now);
 
     for (index, option) in open.options.iter().enumerate() {
         let rect = layout.option(index);
@@ -234,10 +267,25 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
     }
 }
 
-/// Keys 1 to 4 answer. Esc suspends the question and lets Escape close the screen, after which
-/// the `quiz_escape` mixin opens the pause menu.
+/// Esc on a question: it is suspended and Escape closes the screen, after which the
+/// `quiz_escape` mixin opens the pause menu.
+pub(super) fn suspend(teacher: &mut Teacher, now: i64) {
+    if teacher.suspend_question(now) {
+        QUIZ_PAUSES.store(false, Ordering::Relaxed);
+        ESCAPE_PAUSE.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The question's answer, for the next client tick to finish.
+pub(super) fn answered(game: &mut Game, outcome: crate::core::Outcome) {
+    QUIZ_PAUSES.store(false, Ordering::Relaxed);
+    game.outcomes.push(outcome);
+}
+
+/// Keys 1 to 4 answer a choice question; Esc suspends it.
 pub(crate) fn key_pressed(host: &dyn ClientHost, event: &mut ScreenKeyPressedPreEvent<'_>) -> Flow {
     let io = super::io();
+    let io = &*io;
     if !io.our_screen(host) {
         return Flow::Continue;
     }
@@ -247,12 +295,16 @@ pub(crate) fn key_pressed(host: &dyn ClientHost, event: &mut ScreenKeyPressedPre
     let Some(teacher) = teacher.as_mut() else {
         return Flow::Continue;
     };
-    let index = match event.key {
+    let (key, modifiers) = (event.key, event.modifiers);
+    if game.settings.is_some() {
+        return settings::key_pressed(host, io, teacher, game, key, modifiers);
+    }
+    if showing(teacher).is_some_and(|open| open.kind == QuestionKind::Typing) {
+        return typing::key_pressed(host, io, teacher, game, key, modifiers, now);
+    }
+    let index = match key {
         "key.keyboard.escape" => {
-            if teacher.suspend_question(now) {
-                QUIZ_PAUSES.store(false, Ordering::Relaxed);
-                ESCAPE_PAUSE.store(true, Ordering::Relaxed);
-            }
+            suspend(teacher, now);
             return Flow::Continue;
         }
         "key.keyboard.1" => 0,
@@ -262,10 +314,77 @@ pub(crate) fn key_pressed(host: &dyn ClientHost, event: &mut ScreenKeyPressedPre
         _ => return Flow::Continue,
     };
     if let Some(outcome) = teacher.choose(index, now) {
-        QUIZ_PAUSES.store(false, Ordering::Relaxed);
-        game.outcomes.push(outcome);
+        answered(game, outcome);
     }
     Flow::Cancel
+}
+
+/// A typed character goes to the typed question's edit box.
+pub(crate) fn char_typed(host: &dyn ClientHost, event: &mut ScreenCharTypedPreEvent<'_>) -> Flow {
+    let io = super::io();
+    let io = &*io;
+    if !io.our_screen(host) {
+        return Flow::Continue;
+    }
+    let now = io.now();
+    let mut state = lock(&STATE);
+    let State { teacher, game } = &mut *state;
+    let Some(teacher) = teacher.as_mut() else {
+        return Flow::Continue;
+    };
+    if game.settings.is_some()
+        || !showing(teacher).is_some_and(|open| open.kind == QuestionKind::Typing)
+    {
+        return Flow::Continue;
+    }
+    typing::char_typed(host, io, teacher, game, event.c, now)
+}
+
+/// A mouse button let go: a drag on the typed question's box or a settings slider ends.
+pub(crate) fn mouse_released(
+    host: &dyn ClientHost,
+    event: &mut ScreenMouseButtonReleasedPreEvent<'_>,
+) -> Flow {
+    let io = super::io();
+    if !io.our_screen(host) {
+        return Flow::Continue;
+    }
+    let mut state = lock(&STATE);
+    let game = &mut state.game;
+    let input = if let Some(page) = game.settings.as_mut() {
+        page.released(event.button)
+    } else if let Some(typing) = game.typing.as_mut() {
+        typing.released(event.button)
+    } else {
+        return Flow::Continue;
+    };
+    if input { Flow::Cancel } else { Flow::Continue }
+}
+
+/// The pointer moved with a button held: the box's selection or a settings slider follows it.
+pub(crate) fn mouse_dragged(
+    host: &dyn ClientHost,
+    event: &mut ScreenMouseDraggedPreEvent<'_>,
+) -> Flow {
+    let io = super::io();
+    let io = &*io;
+    if !io.our_screen(host) {
+        return Flow::Continue;
+    }
+    let mut state = lock(&STATE);
+    let State { teacher, game } = &mut *state;
+    let Some(teacher) = teacher.as_mut() else {
+        return Flow::Continue;
+    };
+    let (at, button) = (event.screen.mouse, event.button);
+    let taken = if game.settings.is_some() {
+        settings::dragged(host, io, teacher, game, at, button)
+    } else if let Some(typing) = game.typing.as_mut() {
+        typing.dragged(host, io, at, button)
+    } else {
+        false
+    };
+    if taken { Flow::Cancel } else { Flow::Continue }
 }
 
 /// A left click on an option answers it; on the replay button it plays the phrase again.
@@ -285,9 +404,15 @@ pub(crate) fn mouse_pressed(
     let Some(teacher) = teacher.as_mut() else {
         return Flow::Continue;
     };
+    if game.settings.is_some() {
+        return settings::mouse_pressed(host, io, teacher, game, mouse, event.modifiers);
+    }
     let Some(open) = showing(teacher) else {
         return Flow::Continue;
     };
+    if open.kind == QuestionKind::Typing {
+        return typing::mouse_pressed(host, io, teacher, game, mouse, event.modifiers, now);
+    }
     let (listening, count) = (open.listening, open.options.len());
     let layout = Layout::new(game.screen_size);
     if listening && inside(mouse, layout.replay()) {
@@ -300,8 +425,7 @@ pub(crate) fn mouse_pressed(
     };
     sound::click(host, io);
     if let Some(outcome) = teacher.choose(index, now) {
-        QUIZ_PAUSES.store(false, Ordering::Relaxed);
-        game.outcomes.push(outcome);
+        answered(game, outcome);
     }
     Flow::Cancel
 }
