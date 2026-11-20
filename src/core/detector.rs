@@ -23,6 +23,10 @@ const STATE_GRACE_MS: i64 = 1000;
 const CLIMATE_DEBOUNCE_MS: i64 = 3000;
 const KILL_CREDIT_MS: i64 = 6000;
 const WEATHER_AFTER_JOIN_MS: i64 = 3000;
+/// How long after the last tick of a fast fall a health drop is still the fall's. The original
+/// looks one tick back, but a client hears its health from the server, a tick or more after the
+/// landing it reported.
+const FALL_HURT_MS: i64 = 1000;
 const HOT_TEMPERATURE: f32 = 1.5;
 const AIR: &str = "minecraft:air";
 
@@ -228,7 +232,8 @@ pub(crate) struct Detector {
     drop_check: Option<String>,
     last_health: f32,
     was_dead: bool,
-    was_falling: bool,
+    /// The last tick the player fell faster than 0.6 blocks a tick, off the ground.
+    fell_at: Option<i64>,
     was_on_ground: bool,
     hungry_said: bool,
     last_jump_at: i64,
@@ -537,6 +542,7 @@ impl Detector {
             self.last_health = input.health;
             self.was_dead = input.dead;
             self.was_on_ground = input.on_ground;
+            self.fell_at = None;
             self.hungry_said = input.food <= 6;
         }
         self.read_drivers(input);
@@ -894,8 +900,8 @@ impl Detector {
         self.was_on_ground = input.on_ground;
     }
 
-    /// Death (said at once and recorded), and damage over half a heart: `fall` after a fast fall,
-    /// else `hurt`, as a series.
+    /// Death (said at once and recorded), and damage over half a heart: `fall` within
+    /// `FALL_HURT_MS` of a fast fall, else `hurt`, as a series. Water ends a fall unhurt.
     fn damage(
         &mut self,
         input: &WorldTick<'_>,
@@ -908,14 +914,22 @@ impl Detector {
             out.extend(pack.phrase("die").cloned().map(Speech::Now));
             out.push(Speech::Died);
         } else if !input.dead && self.last_health >= 0.0 && health < self.last_health - 0.5 {
-            let id = if self.was_falling { "fall" } else { "hurt" };
+            let fell = self
+                .fell_at
+                .take()
+                .is_some_and(|at| input.now - at <= FALL_HURT_MS);
+            let id = if fell { "fall" } else { "hurt" };
             if let Some(phrase) = pack.phrase(id) {
                 out.extend(self.say(phrase, Driver::Series, input.now, config));
             }
         }
         self.was_dead = input.dead;
         self.last_health = health;
-        self.was_falling = !input.on_ground && input.velocity[1] < -0.6;
+        if !input.on_ground && input.velocity[1] < -0.6 {
+            self.fell_at = Some(input.now);
+        } else if input.in_water {
+            self.fell_at = None;
+        }
     }
 
     /// A watched entity that is dying now is the player's kill: `kill.<entity>`, else `kill_it`.

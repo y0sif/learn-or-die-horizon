@@ -1516,9 +1516,12 @@ fn every_action_is_said_under_its_rules() {
             ("0 tick", ""), ("100 jump", "jump"), ("200 land", ""), ("300 jump", ""), ("4200 land", ""),
             ("4300 jump", "jump"),
         ]),
-        ("damage: hurt, a pause before the next, a fall, death", |c| c.same_again_seconds = 0.0, &[
+        ("damage: hurt, a pause before the next, a fall heard up to 1 s after it but not after water, death",
+            |c| c.same_again_seconds = 0.0, &[
             ("0 tick", ""), ("100 health 18", "hurt"), ("1000 health 16", ""), ("3100 health 14", "hurt"),
-            ("3200 drop_fast", ""), ("3300 land 12", "fall"), ("3400 die", "die"),
+            ("3200 drop_fast", ""), ("3250 land", ""), ("3400 health 12", "fall"),
+            ("5500 drop_fast", ""), ("5550 land", ""), ("6600 health 10", "hurt"),
+            ("8700 drop_fast", ""), ("8750 swim", ""), ("8800 health 9", "hurt"), ("8900 die", "die"),
         ]),
         ("damage off", |c| c.say_damage = false, &[
             ("0 tick", ""), ("100 health 18", ""), ("200 die", ""),
@@ -1799,13 +1802,15 @@ fn settings_rows_go_round_or_stop_at_their_ends() {
         Shown,
     );
     #[rustfmt::skip]
-    let rows: [Row; 17] = [
+    let rows: [Row; 18] = [
         ("a switch flips", Page::Main, "enabled", |_| {}, &[1], Shown::Flag(true), Shown::Flag(false)),
         ("sound shows the voice on, and a click mutes it", Page::Main, "sound", |_| {}, &[1],
             Shown::Flag(true), Shown::Flag(false)),
         ("a choice goes round", Page::Main, "quiz_mode", |_| {}, &[1, 1, 1], choice("choice"), choice("off")),
-        ("a value the row does not list shows the first, and steps on from it", Page::Main, "quiz_mode",
-            |c| c.quiz_mode = "speech".into(), &[1], choice("off"), choice("choice")),
+        ("a value the row does not list shows the first, and steps on from it", Page::Advanced, "position",
+            |c| c.hud_anchor = "middle".into(), &[1], choice("bottom"), choice("top")),
+        ("speech asks with buttons: it shows as the button mode and steps on from it", Page::Main,
+            "quiz_mode", |c| c.quiz_mode = "speech".into(), &[1], choice("choice"), choice("typing")),
         ("a number stops at its top", Page::Main, "quiz_interval", |_| {}, &[20], text("60 s"), text("300 s")),
         ("and at its bottom", Page::Main, "quiz_answer", |_| {}, &[-20], text("12 s"), text("5 s")),
         ("a value between steps shows the nearest", Page::Main, "text_scale", |c| c.hud_scale = 2.1, &[1],

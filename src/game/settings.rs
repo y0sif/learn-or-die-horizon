@@ -11,7 +11,7 @@
 //! language loads the pack again, as the original reloads its resources.
 //!
 //! Esc or Done goes back a page; on the main page it closes the screen. Like an options screen,
-//! a page pauses single player.
+//! a page pauses single player and blurs the world and the HUD behind it.
 use super::client::{Client, View, WidgetHost};
 use super::screen::inside;
 use super::{Game, files, keys};
@@ -262,7 +262,8 @@ fn changed(host: &dyn ClientHost, io: &dyn Client, teacher: &Teacher, game: &mut
 }
 
 /// Moves row `index` with `step`: a click, Shift-click, an arrow key, or the pointer's position
-/// on a slider.
+/// on a slider. Saved when the value changed, which a value between a slider's steps does on a
+/// click at the step it shows at.
 fn set(
     host: &dyn ClientHost,
     io: &dyn Client,
@@ -275,12 +276,12 @@ fn set(
         return;
     };
     let row = page.rows[index].clone();
-    let before = row.position(&teacher.config);
+    let before = teacher.config.clone();
     match step {
         Step::By(delta) => row.cycle(&mut teacher.config, delta),
         Step::To(position) => row.set_position(&mut teacher.config, position),
     }
-    if row.position(&teacher.config) != before {
+    if teacher.config != before {
         changed(host, io, teacher, game, row.name);
     }
 }
@@ -302,9 +303,10 @@ fn back(teacher: &Teacher, game: &mut Game) {
     }
 }
 
-/// The page: the menu background, the title, the buttons, and over each slider row the
-/// slider's track, handle and label (the buttons stay under them for the narrator, a
-/// controller and horizon-ctl's `ui`).
+/// The page: the world and the HUD blurred and the in-world menu background over them
+/// (`Screen.renderBackground` in a world, as the original's `OptionsSubScreen` has it), the title,
+/// the buttons, and over each slider row the slider's track, handle and label (the buttons stay
+/// under them for the narrator, a controller and horizon-ctl's `ui`).
 pub(super) fn render(
     host: &dyn ClientHost,
     io: &dyn Client,
@@ -318,6 +320,7 @@ pub(super) fn render(
     };
     let size = draw.size();
     let [w, h] = size;
+    io.blur(host);
     draw.draw_menu_background([0.0, 0.0, w, h], true);
     let title = io.tr(host, &Text::translate(title(page.page), vec![]));
     let title_w = draw.text_width(&title);

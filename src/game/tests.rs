@@ -43,13 +43,16 @@ const PHRASES: &str = r#"{
     {"id": "pickup.quux", "action": "pickup", "key": "quux", "text": "Ich nehme das Quäx.", "en": "I take the quux."},
     {"id": "break.zap", "action": "break", "key": "zap", "text": "Ich zerbreche den Zäp.", "en": "I break the zap."},
     {"id": "use.zing", "action": "use", "key": "zing", "text": "Ich benütze das Zing.", "en": "I use the zing."},
-    {"id": "hungry", "action": "hungry", "text": "Ich möchte essen.", "en": "I want to eat."}
+    {"id": "hungry", "action": "hungry", "text": "Ich möchte essen.", "en": "I want to eat."},
+    {"id": "drop.bloop", "action": "drop", "key": "bloop", "text": "Ich lasse den Blööp fallen.", "en": "I let the bloop fall."},
+    {"id": "burning", "action": "burning", "text": "Ich glühe.", "en": "I glow."},
+    {"id": "fish", "action": "fish", "text": "Ich fänge Fische.", "en": "I catch fish."}
   ]
 }"#;
 
 const LIPSYNC: &str = r#"{"window": 40, "clips": {"v1.normal.hold.quux": "1221"}}"#;
 
-const IDS: [&str; 9] = [
+const IDS: [&str; 12] = [
     "break.bloop",
     "place.bloop",
     "pickup.bloop",
@@ -59,6 +62,9 @@ const IDS: [&str; 9] = [
     "break.zap",
     "use.zing",
     "hungry",
+    "drop.bloop",
+    "burning",
+    "fish",
 ];
 const SPEEDS: [&str; 2] = ["normal", "slow"];
 const START: i64 = 1_700_000_000_000;
@@ -92,6 +98,8 @@ struct Session {
     click: Option<Click>,
     /// The consequences the answers sent to the integrated server.
     sent: Vec<Vec<ServerAction>>,
+    /// Frames that asked for the menu blur.
+    blurred: usize,
 }
 
 #[derive(Default)]
@@ -195,6 +203,9 @@ impl Client for TestClient {
     }
     fn our_screen(&self, _: &dyn ClientHost) -> bool {
         self.session().screen
+    }
+    fn blur(&self, _: &dyn ClientHost) {
+        self.session().blurred += 1;
     }
     fn open_screen(&self, _: &mut dyn ClientHost) -> bool {
         let mut session = self.session();
@@ -768,6 +779,28 @@ fn hooks_drive_the_teacher() {
         assert_eq!(io.plays("hungry"), 1);
         io.update(|view| view.food = 20);
 
+        // The drop key, told by its key hook: the held bloop one fewer is a drop.
+        io.update(|view| view.inventory = Some(vec![("minecraft:bloop".into(), 2)]));
+        tick(&mut host, &io, 100);
+        let drop_key = |host: &mut FakeHost, pressed| {
+            mod_api::dispatch_key_mapping_pre(host, "key.drop", pressed, &mut false);
+        };
+        drop_key(&mut host, true);
+        io.update(|view| view.inventory = Some(vec![("minecraft:bloop".into(), 1)]));
+        tick(&mut host, &io, 100);
+        drop_key(&mut host, false);
+        for _ in 0..3 {
+            tick(&mut host, &io, 100);
+        }
+        assert_eq!(io.plays("drop.bloop"), 1);
+
+        // The fire drawn over the view: he burns, once while the frames show it.
+        super::detect::fire_drawn();
+        for _ in 0..5 {
+            tick(&mut host, &io, 100);
+        }
+        assert_eq!(io.plays("burning"), 1);
+
         // I opens the settings' main page, which pauses as an options screen does, every button
         // on screen in a 350 by 405 window. A click on Questions moves it on to typed questions,
         // saved at once. The page button opens the advanced page; Esc goes back, and on the main
@@ -778,8 +811,12 @@ fn hooks_drive_the_teacher() {
         assert_eq!(settings_page(), Some(Page::Main));
         tick(&mut host, &io, 50);
         assert!(quiz_pauses());
+        with_state(|teacher, _| {
+            teacher.expect("the teacher").config.quiz_interval_seconds = 20.0;
+        });
         let mut canvas = Canvas::sized([350.0, 405.0]);
         mod_api::dispatch_screen_render_post(&host, &mut canvas, &screen);
+        assert_eq!(io.session().blurred, 1, "the page blurs what is behind it");
         for (label, [x, y, w, h]) in &canvas.buttons {
             let on_screen = *x >= 0.0 && *y >= 0.0 && x + w <= 350.0 && y + h <= 405.0;
             assert!(on_screen, "{label} at {:?}", [x, y, w, h]);
@@ -789,6 +826,16 @@ fn hooks_drive_the_teacher() {
         assert_eq!(
             config.expect("config written")["quizMode"],
             Value::from("typing")
+        );
+        // Ask every 20 s shows at its nearest step, 15 s; a click on that step saves 15 s.
+        let [x, y, _, h] = canvas.button("options.quiz_interval");
+        let at = screen_at([x + 4.0, y + h / 2.0]);
+        mod_api::dispatch_screen_mouse_button_pressed_pre(&host, &at, 0, 0, &mut false);
+        mod_api::dispatch_screen_mouse_button_released_pre(&host, &at, 0, 0, &mut false);
+        let config = io.file(Store::Config, files::CONFIG_FILE);
+        assert_eq!(
+            config.expect("config written")["quizIntervalSeconds"],
+            Value::from(15.0)
         );
         assert!(click_at(&host, canvas.button("options.advanced")));
         assert_eq!(settings_page(), Some(Page::Advanced));
@@ -898,6 +945,19 @@ fn hooks_drive_the_teacher() {
             chat.iter().any(|line| line.starts_with("Nein!")),
             "{chat:?}"
         );
+
+        // The integrated server tells what a client cannot read of its host's player: a cast
+        // fishing hook is fishing, said once the answer's lines are over.
+        io.update(|view| view.paused = false);
+        super::detect::set_host_facts(Some(super::detect::HostFacts {
+            fishing: true,
+            ..Default::default()
+        }));
+        for _ in 0..40 {
+            tick(&mut host, &io, 100);
+        }
+        super::detect::set_host_facts(None);
+        assert_eq!(io.plays("fish"), 1);
 
         // The toggle key turns him off, says so in chat, and the config file keeps it.
         io.session().clicks.push(keys::TOGGLE);

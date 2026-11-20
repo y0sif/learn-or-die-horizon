@@ -7,13 +7,18 @@
 //!
 //! A client reads no health of another entity, so whether one is hurt or dying comes from how
 //! the game draws it (`render_living_pre`: its hurt flash and death time), kept for one tick.
+//!
+//! Some of the player's own state reaches the layer through hooks rather than reads, and is put
+//! into the tick's view by [`merge_events`]: the drop key (`key_mapping_pre`: the `mapping` read
+//! answers the movement keys, attack and use only), the fire over the view (a client reads no
+//! fire ticks), and what the integrated server knows of its host's player ([`HostFacts`]).
 use super::client::{Client, View};
 use super::{STATE, State, lock};
 use crate::core::{Fate, Teacher, WorldTick};
 use mod_api::game::MobRender;
 use mod_api::{BlockClick, ClientHost, EntityRef, InteractionKey, ItemStack};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 const PLACE_WAIT_MS: i64 = 500;
 /// `hurtDuration`: the hurt flash's ticks, as a hit sets it. A frame of the tick after the hit
@@ -22,6 +27,79 @@ const HURT_TICKS: i32 = 10;
 
 /// The Hardcore flag of the world, as the health bar's inputs last showed it.
 static HARDCORE: AtomicBool = AtomicBool::new(false);
+
+/// The drop key (`key.drop`) is held, and it went down since the last tick read it (a tap
+/// between two ticks counts too).
+static DROP_HELD: AtomicBool = AtomicBool::new(false);
+static DROP_PRESSED: AtomicBool = AtomicBool::new(false);
+/// When a frame last drew the fire over the first-person view, in the seam's ms.
+static FIRE_DRAWN_AT: AtomicI64 = AtomicI64::new(i64::MIN);
+/// How long a drawn fire keeps the player burning: a few frames, so a slow frame between two
+/// ticks does not put the fire out.
+const FIRE_FRAME_MS: i64 = 250;
+
+/// What the integrated server knows of its host's own player that a client cannot read
+/// (`Entity.getVehicle`, `Player.fishing`, `Entity.isOnFire` in either camera). The server's half
+/// sets it, in single player and on the host of a LAN world; the client reads it only there.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct HostFacts {
+    /// The vehicle's entity type id (a sheep is `<colour>_sheep`).
+    pub(crate) vehicle: Option<String>,
+    /// A cast fishing hook of the player's is out.
+    pub(crate) fishing: bool,
+    pub(crate) on_fire: bool,
+}
+
+static HOST_FACTS: Mutex<Option<HostFacts>> = Mutex::new(None);
+
+/// From the integrated server's half: its host's player now, `None` once it stops.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the server's half (server.rs) is to set it")
+)]
+pub(crate) fn set_host_facts(facts: Option<HostFacts>) {
+    *lock(&HOST_FACTS) = facts;
+}
+
+/// From the `key_mapping_pre` hook: a physical key or button bound to `mapping` went down or up.
+pub(crate) fn key_mapping(mapping: &str, pressed: bool) {
+    if mapping != "key.drop" {
+        return;
+    }
+    DROP_HELD.store(pressed, Ordering::Relaxed);
+    if pressed {
+        DROP_PRESSED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// From the `extract_block_screen_effect` hook: a frame drew the fire over the view, which the
+/// game does while the player burns (`isOnFire`), in first person.
+pub(crate) fn fire_drawn() {
+    FIRE_DRAWN_AT.store(super::io().now(), Ordering::Relaxed);
+}
+
+/// Puts what the hooks told since the last tick into the tick's view: the drop key, the fire
+/// drawn over the view, and in single player the integrated server's facts of its host's player.
+pub(crate) fn merge_events(view: &mut View, now: i64) {
+    let pressed = DROP_PRESSED.swap(false, Ordering::Relaxed);
+    if view.screen_open {
+        // A screen lets go of every key (`KeyMapping.releaseAll`), and no release is told then.
+        DROP_HELD.store(false, Ordering::Relaxed);
+    } else {
+        view.drop_key |= pressed || DROP_HELD.load(Ordering::Relaxed);
+    }
+    let since_fire = now.saturating_sub(FIRE_DRAWN_AT.load(Ordering::Relaxed));
+    view.on_fire |= (0..=FIRE_FRAME_MS).contains(&since_fire);
+    if !view.singleplayer {
+        return;
+    }
+    if let Some(facts) = lock(&HOST_FACTS).clone() {
+        view.vehicle = view.vehicle.take().or(facts.vehicle);
+        view.in_vehicle |= view.vehicle.is_some();
+        view.fishing |= facts.fishing;
+        view.on_fire |= facts.on_fire;
+    }
+}
 
 /// Living entities drawn hurt or dying since the last client tick.
 struct Sightings {

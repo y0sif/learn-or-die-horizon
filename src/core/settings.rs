@@ -5,7 +5,8 @@
 //! Left out: rows for packs with readings or several looks, voice answers and the exam page, and
 //! rows of features the port does not have (the score counter, the question timer line, the
 //! learned jingle, tooltips, and the font, which is the same either way for German). The original
-//! offers the `speech` quiz mode; here a `speech` config asks with buttons and the row skips it.
+//! offers the `speech` quiz mode; here a `speech` config asks with buttons, so the row shows it as
+//! the button mode and steps on from there.
 use super::config::Config;
 use super::pack::Pack;
 
@@ -264,7 +265,10 @@ fn main_page(pack: &Pack) -> Vec<Setting> {
         choice(
             "quiz_mode",
             &["off", "choice", "typing", "mixed"],
-            |c| &c.quiz_mode,
+            |c| match c.quiz_mode.as_str() {
+                "speech" => "choice",
+                mode => mode,
+            },
             |c, v| c.quiz_mode = v.to_string(),
         ),
         choice(

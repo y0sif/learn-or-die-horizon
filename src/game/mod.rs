@@ -215,6 +215,7 @@ fn tick(host: &mut dyn ClientHost) {
         QUIZ_PAUSES.store(false, Ordering::Relaxed);
         return;
     };
+    detect::merge_events(&mut view, now);
     settings::tick(host, io, game, &view);
     keys::handle(host, io, teacher, game, now);
     if game.settings.is_some() {

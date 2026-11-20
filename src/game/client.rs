@@ -59,8 +59,12 @@ pub struct View {
     pub inventory: Option<Vec<(String, i32)>>,
     pub health: f32,
     pub sleeping: bool,
+    /// Riding something; a client reads no vehicle, so only the integrated server's facts
+    /// (`detect::merge_events`) set it.
     pub in_vehicle: bool,
     pub in_water: bool,
+    /// Standing on a block (`Entity.onGround`): a client reads no ground, so it is a block's
+    /// collision box right under the player's box.
     pub on_ground: bool,
     pub fall_flying: bool,
     pub position: [f64; 3],
@@ -70,20 +74,25 @@ pub struct View {
     pub hardcore: bool,
     /// The food level, 0 to 20.
     pub food: i32,
-    /// The vehicle's entity type id.
+    /// The vehicle's entity type id, from the integrated server's facts.
     pub vehicle: Option<String>,
     /// Creative flight.
     pub flying: bool,
     pub on_climbable: bool,
+    /// Sprinting: the movement speed carries the `minecraft:sprinting` modifier, which
+    /// `setSprinting` adds and takes off on the client too.
     pub sprinting: bool,
     pub sneaking: bool,
-    /// On fire, or in lava.
+    /// On fire, or in lava: lava, a fire block where the player stands, the fire drawn over the
+    /// view, or the integrated server's facts.
     pub on_fire: bool,
-    /// A fishing rod in hand and a bobber out near the player.
+    /// A fishing hook of the player's is out, from the integrated server's facts: the client
+    /// keeps its own hook outside the entities a mod can list.
     pub fishing: bool,
     /// The item in use, when it is food or a consumable.
     pub eating: Option<String>,
-    /// A movement key, the jump key, the drop key is down.
+    /// A movement key, the jump key, the drop key is down. The drop key comes from the
+    /// `key_mapping_pre` hook (`detect::merge_events`).
     pub move_keys: bool,
     pub jump_key: bool,
     pub drop_key: bool,
@@ -145,6 +154,8 @@ pub trait Client: Send + Sync {
     fn click(&self, host: &dyn ClientHost, click: &BlockClick<'_>) -> Option<Click>;
     /// This mod's screen is the one open.
     fn our_screen(&self, host: &dyn ClientHost) -> bool;
+    /// Asks for the menu blur over the world and the HUD this frame, as an options screen has.
+    fn blur(&self, host: &dyn ClientHost);
     fn open_screen(&self, host: &mut dyn ClientHost) -> bool;
     fn close_screen(&self, host: &mut dyn ClientHost);
     /// Takes every click waiting on the mod's key mapping `key`.
@@ -285,16 +296,31 @@ fn snows(temperature: f32, y: i32) -> bool {
     at < 0.15
 }
 
-/// The entity types in `level` within `radius` of `at`.
-fn kinds_near(host: &dyn ClientHost, level: LevelRef, at: [f64; 3], radius: f64) -> Vec<String> {
-    let min = at.map(|c| c - radius);
-    let max = at.map(|c| c + radius);
+/// How far under the player's box the ground is looked for.
+const GROUND_PROBE: f64 = 1.0e-3;
+
+/// `Entity.onGround`, which a client cannot read: a block's collision box lies right under the
+/// player's predicted box. True where the box or the blocks under it cannot be read.
+fn on_ground(host: &dyn ClientHost, level: LevelRef, entity: EntityRef) -> bool {
+    let Some([[x0, y0, z0], [x1, _, z1]]) = entity.bounding_box(host) else {
+        return true;
+    };
     level
-        .entities_in(host, min, max)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entity| entity.kind(host).map(|key| key.id(host)))
-        .collect()
+        .has_collisions(host, [x0, y0 - GROUND_PROBE, z0, x1, y0, z1])
+        .unwrap_or(true)
+}
+
+/// A fire block where the player stands, at the feet or the head (`BaseFireBlock.entityInside`
+/// sets a player inside one on fire).
+fn in_fire(host: &dyn ClientHost, level: LevelRef, [x, y, z]: [i32; 3]) -> bool {
+    [y, y + 1].into_iter().any(|y| {
+        level.block_state(host, [x, y, z]).is_some_and(|state| {
+            matches!(
+                state.block().id(host).as_str(),
+                "minecraft:fire" | "minecraft:soul_fire"
+            )
+        })
+    })
 }
 
 fn distance_sq(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -383,16 +409,13 @@ impl Client for HostClient {
         let in_water = in_fluid("water");
         let position = entity.position(host).unwrap_or([0.0; 3]);
         let block = position.map(|c| c.floor() as i32);
-        let off_hand = living.and_then(|l| l.hand_item(host, Hand::Off));
-        let is_rod = |stack: &Option<ItemStack>| {
-            stack
-                .as_ref()
-                .is_some_and(|s| s.item().id(host) == "minecraft:fishing_rod")
-        };
-        let fishing = (is_rod(&held) || is_rod(&off_hand))
-            && kinds_near(host, level, position, 33.0)
-                .iter()
-                .any(|kind| kind == "minecraft:fishing_bobber");
+        let sprinting = living
+            .and_then(|l| l.attribute_modifiers(host, "minecraft:movement_speed"))
+            .is_some_and(|modifiers| {
+                modifiers
+                    .iter()
+                    .any(|m| m.id.namespace() == "minecraft" && m.id.path() == "sprinting")
+            });
         let eating = host
             .local_item_use()
             .and_then(|using| living?.hand_item(host, using.hand))
@@ -432,31 +455,28 @@ impl Client for HostClient {
             inventory,
             health: living.and_then(|l| l.health(host)).unwrap_or(20.0),
             sleeping: living.and_then(|l| l.is_sleeping(host)).unwrap_or(false),
-            in_vehicle: entity.vehicle(host).is_some(),
+            in_vehicle: false,
             in_water,
-            on_ground: entity.on_ground(host).unwrap_or(true),
+            on_ground: on_ground(host, level, entity),
             fall_flying: living.and_then(|l| l.is_gliding(host)).unwrap_or(false),
             position,
             yaw,
             pitch,
             hardcore: detect::hardcore(),
             food: player.food(host).map_or(20, |food| food.level),
-            vehicle: entity
-                .vehicle(host)
-                .and_then(|vehicle| vehicle.kind(host))
-                .map(|key| key.id(host)),
+            vehicle: None,
             flying: player.abilities(host).is_some_and(|a| a.flying),
             on_climbable: living.and_then(|l| l.is_climbing(host)).unwrap_or(false),
-            sprinting: entity.is_sprinting(host).unwrap_or(false),
+            sprinting,
             sneaking: entity.is_shift_key_down(host).unwrap_or(false),
-            on_fire: entity.fire_ticks(host).unwrap_or(0) > 0 || in_fluid("lava"),
-            fishing,
+            on_fire: in_fluid("lava") || in_fire(host, level, block),
+            fishing: false,
             eating,
             move_keys: ["key.forward", "key.back", "key.left", "key.right"]
                 .into_iter()
                 .any(down),
             jump_key: down("key.jump"),
-            drop_key: down("key.drop"),
+            drop_key: false,
             velocity: entity.velocity(host).unwrap_or([0.0; 3]),
             dark: !fixed_time && level.get_sky_darken(host).unwrap_or(0) >= 4,
             raining: rain > 0.2,
@@ -507,6 +527,10 @@ impl Client for HostClient {
 
     fn our_screen(&self, host: &dyn ClientHost) -> bool {
         host.mod_screen() == Some(MOD_ID)
+    }
+
+    fn blur(&self, host: &dyn ClientHost) {
+        host.apply_screen_blur();
     }
 
     fn open_screen(&self, host: &mut dyn ClientHost) -> bool {

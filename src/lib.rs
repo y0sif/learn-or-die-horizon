@@ -9,11 +9,12 @@
 //! The client hooks act only for this window's own game: a split-screen player's game, in this
 //! process too, would otherwise drive the same teacher with its own player (`game::hosting`).
 use mod_api::{
-    AddClientReloadListenersEvent, ClientAttackTargetEvent, ClientHost,
-    ClientPlayerLoggingOutEvent, ClientTickPostEvent, EntityInteractEvent, Flow, GuiDraw,
-    GuiLayerDrawEvent, Hand, HealthHudEvent, Hooks, HostSide, InteractionKeyMappingTriggeredEvent,
-    InteractionResult, LogicalSide, RegisterGuiLayersEvent, Registrar, RegistrationContext,
-    RenderLivingPreEvent, RightClickBlockEvent, ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent,
+    AddClientReloadListenersEvent, BlockScreenEffect, ClientAttackTargetEvent, ClientHost,
+    ClientPlayerLoggingOutEvent, ClientTickPostEvent, EntityInteractEvent,
+    ExtractBlockScreenEffectEvent, Flow, GuiDraw, GuiLayerDrawEvent, Hand, HealthHudEvent, Hooks,
+    HostSide, InteractionKeyMappingTriggeredEvent, InteractionResult, KeyMappingPreEvent,
+    LogicalSide, RegisterGuiLayersEvent, Registrar, RegistrationContext, RenderLivingPreEvent,
+    RightClickBlockEvent, ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent,
     ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
     ScreenMouseDraggedPreEvent, ScreenRenderPostEvent, ServerHost, ServerStartedEvent,
     ServerStoppedEvent,
@@ -83,6 +84,32 @@ impl Hooks for Mod {
     ) -> Flow {
         if game::hosting() {
             game::detect::attack(&*host, event.key);
+        }
+        Flow::Continue
+    }
+
+    /// A key bound to a gameplay mapping goes down or up while playing: the drop key is kept for
+    /// the tick (the `mapping` read does not answer it).
+    fn key_mapping_pre(
+        &self,
+        _host: &mut dyn ClientHost,
+        event: &mut KeyMappingPreEvent<'_>,
+    ) -> Flow {
+        if game::hosting() {
+            game::detect::key_mapping(event.mapping, event.pressed);
+        }
+        Flow::Continue
+    }
+
+    /// A frame draws the fire over the first-person view: the player burns (a client reads no
+    /// fire ticks).
+    fn extract_block_screen_effect(
+        &self,
+        _host: &dyn ClientHost,
+        event: &mut ExtractBlockScreenEffectEvent,
+    ) -> Flow {
+        if event.effect == BlockScreenEffect::Fire && game::hosting() {
+            game::detect::fire_drawn();
         }
         Flow::Continue
     }
