@@ -43,5 +43,10 @@ bindings = [
   { name = "game", ty = "&mut Game<'_>", value = "&mut *self" },
 ]
 
-# [[jar]]: the original Learn or Die jar goes here, recorded by `cargo horizon-mod use-jar <jar>` (its assets
-# layer below this package's own; nothing of it is copied into the repo or the .hmod).
+# The official Learn or Die German jar, recorded by `cargo horizon-mod use-jar`. Its assets (the pack, voices,
+# portrait) layer below this package's own; nothing of it is copied into the repo or the .hmod.
+
+[[jar]]
+id = "zhnarrator_de"
+version = "0.6.2+mc26.3"
+sha512 = "3ac6188ef91006ec1e5cd5ce4319a3e4a21d8fe17d39a13a6938226f13f9edb5b0727b1d37ae97be713616b956279b6d45a56bfbc684bc854d99af60108403b1"
