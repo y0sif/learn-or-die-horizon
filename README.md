@@ -3,19 +3,20 @@
 An unofficial Horizon port of Learn or Die by Laren: a German teacher narrates what you do and quizzes you on it.
 
 Learn or Die is made by Laren. Website: [learnordie.me](https://learnordie.me). Official mod:
-[github.com/Larenlearn/learn-or-die](https://github.com/Larenlearn/learn-or-die). This port runs it natively on
-[Horizon](https://github.com/horizon-rust/horizon), the Rust rewrite of Minecraft Java 26.3, with Laren's
-[permission](https://github.com/Larenlearn/learn-or-die/issues/17). For problems with the port, open an issue
-here. For everything else, see the official mod.
+[github.com/Larenlearn/learn-or-die](https://github.com/Larenlearn/learn-or-die).
+
+This port runs it natively on [Horizon](https://github.com/horizon-rust/horizon), the Rust rewrite of
+Minecraft Java 26.3, with Laren's [permission](https://github.com/Larenlearn/learn-or-die/issues/17). For
+problems with the port, open an issue here. For everything else, see the official mod.
 
 ## What it does
 
 The port has the core of Learn or Die with the German pack:
 
 - The teacher says out loud, in German, what you do: breaking and placing blocks, picking up items and holding
-  an item. The sentence shows on screen with its English translation, and her portrait talks along.
-- Multiple-choice questions come up as you play: pick the German for the word shown, with keys 1 to 4 or the
-  mouse. The game pauses in single player while a question is open.
+  an item. The sentence shows on screen with a translation, and his portrait talks along.
+- Multiple-choice questions come up as you play: pick the German for the word or sentence shown, or for the
+  phrase you hear, with keys 1 to 4 or the mouse. The game pauses in single player while a question is open.
 - Your answers are saved per world. A phrase you know is not asked or said again in that world.
 
 Not ported yet: rewards and penalties, typed answers, the exam, the dictionary, "what is this", item tooltips,
@@ -26,7 +27,7 @@ the settings screens and voice answers.
 | Key | Action |
 |---|---|
 | N | Turn the teacher on or off |
-| M | Mute or unmute her voice |
+| M | Mute or unmute the teacher's voice |
 | 1 to 4 | Answer a question |
 | Esc | Pause during a question; it comes back when you resume |
 
