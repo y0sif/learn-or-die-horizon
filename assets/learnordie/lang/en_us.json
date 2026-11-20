@@ -1,0 +1,13 @@
+{
+  "key.learnordie.toggle": "Toggle the teacher",
+  "key.learnordie.mute": "Mute the teacher's voice",
+  "learnordie.quiz.prompt": "Pick the German for:",
+  "learnordie.quiz.listen": "Which one do you hear?",
+  "learnordie.quiz.replay": "Play it again",
+  "learnordie.notice.on": "The teacher is back",
+  "learnordie.notice.off": "The teacher is off",
+  "learnordie.notice.muted": "Voice muted; text and questions go on",
+  "learnordie.notice.unmuted": "Voice on",
+  "learnordie.learned.word": "You know a new word: %s",
+  "learnordie.learned.phrase": "You know a new phrase: %s"
+}

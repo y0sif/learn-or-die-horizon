@@ -1,15 +1,47 @@
 id = "learnordie"
-name = "learnordie"
+name = "Learn or Die (Horizon port)"
 version = "0.1.0"
-description = ""
-authors = []
+description = "An unofficial Horizon port of Learn or Die by Laren: a German teacher narrates what you do and quizzes you on it."
+authors = ["Laren (original Learn or Die)", "y0sif (Horizon port)"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside data/ and assets/.
 api = "0.2"
 side = "both"
 # registries: "May add blocks, items, mob effects and entity types to your worlds".
 capabilities = ["registries"]
+# The German pack (phrases, lipsync, voices, portrait) keeps the original's namespace; its files come from
+# the original jar's layer, not this package. `learnordie` holds the port's own UI strings.
+namespaces = ["zhnarrator_de"]
 
 [native]
 game = "26.3"
 horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
+
+# A mod screen never pauses single player (Screen::Mod is not a pause screen). The original's QuizScreen
+# does when `quizPauseGame` is on (`isPauseScreen`): this adds "the question screen is up and asks to pause"
+# to Minecraft.pause, still for single player only, not published to LAN.
+[[native.mixin]]
+id = "quiz_pause"
+target = "horizon_client::game::pointer_capture::Game<'_>::pauses_game"
+kind = "RETURN"
+helper = "src/mixins/pause.rs"
+bindings = [
+  { name = "value", ty = "bool", value = "$value" },
+  { name = "game", ty = "&Game<'_>", value = "&*self" },
+]
+
+# Esc on the question screen suspends the question and shows the pause menu (QuizScreen.onClose sets a
+# PauseScreen); no API opens the pause menu. After Escape closed the mod screen, this opens it as Escape
+# does from play, only when the question screen's own Esc asked for it.
+[[native.mixin]]
+id = "quiz_escape"
+target = "horizon_client::game::native_hooks::Game<'_>::close_mod_screen"
+kind = "RETURN"
+helper = "src/mixins/escape.rs"
+bindings = [
+  { name = "value", ty = "()", value = "$value" },
+  { name = "game", ty = "&mut Game<'_>", value = "&mut *self" },
+]
+
+# [[jar]]: the original Learn or Die jar goes here, recorded by `cargo horizon-mod use-jar <jar>` (its assets
+# layer below this package's own; nothing of it is copied into the repo or the .hmod).

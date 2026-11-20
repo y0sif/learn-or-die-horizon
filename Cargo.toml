@@ -8,3 +8,7 @@ edition = "2024"
 # launcher builds against its own copy of the same build). Any other registry dependency must be
 # pinned with `horizon-launcher native-lock .` before building.
 horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+
+[dev-dependencies]
+# The wiring test dispatches real hook events through the SDK's test support (docs: concepts/testing.md).
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api", features = ["testing"] }
