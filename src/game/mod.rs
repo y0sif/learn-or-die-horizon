@@ -17,7 +17,9 @@ mod files;
 pub mod hud;
 pub(crate) mod keys;
 pub(crate) mod loading;
+pub(crate) mod payload;
 pub(crate) mod screen;
+pub(crate) mod server;
 mod sound;
 #[cfg(test)]
 mod tests;

@@ -12,3 +12,5 @@ horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
 [dev-dependencies]
 # The wiring test dispatches real hook events through the SDK's test support (docs: concepts/testing.md).
 horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api", features = ["testing"] }
+# Block definitions for the server test's resolved block table (the fake level models no block states).
+horizon-mod-runtime = { path = ".horizon/sdk/api/crates/horizon-mod-runtime" }

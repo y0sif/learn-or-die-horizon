@@ -2,8 +2,9 @@
 //! (`game`). Ported from Learn or Die by Laren, All Rights Reserved, with permission.
 //!
 //! The teacher lives on the client, as in the original: detection, his voice, the HUD and the
-//! question screen all run there, so he works on any server. The integrated server's half only
-//! hands the client the world seed for the progress file's world key.
+//! question screen all run there, so he works on any server. The integrated server's half hands
+//! the client the world seed for the progress file's world key, and applies an answer's
+//! consequences to the host's own player (`game::server`).
 //!
 //! The client hooks act only for this window's own game: a split-screen player's game, in this
 //! process too, would otherwise drive the same teacher with its own player (`game::hosting`).
@@ -25,6 +26,7 @@ struct Mod;
 impl Hooks for Mod {
     fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
         game::keys::register(r);
+        game::payload::register(r);
     }
 
     fn register_gui_layers(
