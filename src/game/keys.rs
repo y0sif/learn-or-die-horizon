@@ -1,5 +1,5 @@
 //! The two key mappings of the pilot, on the original's default keys and listed in Options >
-//! Controls under the mod: N turns the teacher on or off, M mutes her voice (the text and the
+//! Controls under the mod: N turns the teacher on or off, M mutes his voice (the text and the
 //! questions stay). Each change is saved to the config and told in chat, as the original's
 //! `actionBar` does (`sendSystemMessage`), in the port's own words.
 use super::client::Client;

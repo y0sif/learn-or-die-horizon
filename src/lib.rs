@@ -1,9 +1,12 @@
 //! Learn or Die (Horizon port): the game-independent teacher (`core`) wired to the game's hooks
 //! (`game`). Ported from Learn or Die by Laren, All Rights Reserved, with permission.
 //!
-//! The teacher lives on the client, as in the original: detection, her voice, the HUD and the
-//! question screen all run there, so she works on any server. The integrated server's half only
+//! The teacher lives on the client, as in the original: detection, his voice, the HUD and the
+//! question screen all run there, so he works on any server. The integrated server's half only
 //! hands the client the world seed for the progress file's world key.
+//!
+//! The client hooks act only for this window's own game: a split-screen player's game, in this
+//! process too, would otherwise drive the same teacher with its own player (`game::hosting`).
 use mod_api::{
     AddClientReloadListenersEvent, ClientHost, ClientPlayerLoggingOutEvent, ClientTickPostEvent,
     Flow, GuiLayerDrawEvent, Hooks, HostSide, InteractionKeyMappingTriggeredEvent, LogicalSide,
@@ -51,7 +54,9 @@ impl Hooks for Mod {
     }
 
     fn client_tick_post(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPostEvent) {
-        game::client_tick(host);
+        if game::hosting() {
+            game::client_tick(host);
+        }
     }
 
     fn client_player_logging_out(
@@ -59,7 +64,9 @@ impl Hooks for Mod {
         host: &mut dyn ClientHost,
         _event: &mut ClientPlayerLoggingOutEvent,
     ) {
-        game::logging_out(host);
+        if game::hosting() {
+            game::logging_out(host);
+        }
     }
 
     /// The attack key acts on the crosshair's target: a block that breaks at once is counted at
@@ -69,7 +76,9 @@ impl Hooks for Mod {
         host: &mut dyn ClientHost,
         event: &mut InteractionKeyMappingTriggeredEvent,
     ) -> Flow {
-        game::detect::attack(&*host, event.key);
+        if game::hosting() {
+            game::detect::attack(&*host, event.key);
+        }
         Flow::Continue
     }
 
@@ -77,6 +86,7 @@ impl Hooks for Mod {
     fn right_click_block(&self, host: HostSide, event: &mut RightClickBlockEvent<'_>) -> Flow {
         if let HostSide::Client(host) = host
             && event.click.side == LogicalSide::Client
+            && game::hosting()
         {
             game::detect::right_click_block(&*host, event.click);
         }
@@ -84,11 +94,15 @@ impl Hooks for Mod {
     }
 
     fn gui_layer_draw(&self, host: &dyn ClientHost, event: &mut GuiLayerDrawEvent<'_>) {
-        game::hud::draw(host, event);
+        if game::hosting() {
+            game::hud::draw(host, event);
+        }
     }
 
     fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
-        game::screen::render(host, event);
+        if game::hosting() {
+            game::screen::render(host, event);
+        }
     }
 
     fn screen_mouse_button_pressed_pre(
@@ -96,6 +110,9 @@ impl Hooks for Mod {
         host: &dyn ClientHost,
         event: &mut ScreenMouseButtonPressedPreEvent<'_>,
     ) -> Flow {
+        if !game::hosting() {
+            return Flow::Continue;
+        }
         game::screen::mouse_pressed(host, event)
     }
 
@@ -104,6 +121,9 @@ impl Hooks for Mod {
         host: &dyn ClientHost,
         event: &mut ScreenKeyPressedPreEvent<'_>,
     ) -> Flow {
+        if !game::hosting() {
+            return Flow::Continue;
+        }
         game::screen::key_pressed(host, event)
     }
 }

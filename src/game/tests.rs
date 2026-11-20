@@ -58,11 +58,15 @@ const ZAP: [i32; 3] = [5, 64, 4];
 const ABOVE: [i32; 3] = [4, 65, 4];
 /// A progress file from an earlier session.
 const KEPT: &[u8] = br#"{"worlds": {"server:earlier": {}}}"#;
+/// A config from an earlier session that does not parse.
+const BAD_CONFIG: &[u8] = br#"{"enabled": fals"#;
 
 /// What the scripted client holds and what the mod did to it.
 #[derive(Default)]
 struct Session {
     now: i64,
+    /// Whose game the hooks run for: 0 this window's own, 1 split-screen P2.
+    seat: usize,
     view: Option<View>,
     blocks: HashMap<[i32; 3], String>,
     /// The block under the crosshair.
@@ -107,6 +111,14 @@ impl TestClient {
         self.plays(id) > 0
     }
 
+    /// A copy of `bytes` was set aside as `<name>.invalid-<ms>.bak`.
+    fn set_aside(&self, store: Store, name: &str, bytes: &[u8]) -> bool {
+        let prefix = format!("{name}.invalid-");
+        self.session().files.iter().any(|((s, file), kept)| {
+            *s == store && file.starts_with(&prefix) && file.ends_with(".bak") && kept == bytes
+        })
+    }
+
     fn file(&self, store: Store, name: &str) -> Option<Value> {
         let bytes = self
             .session()
@@ -133,6 +145,9 @@ fn plain(text: &Text) -> String {
 impl Client for TestClient {
     fn now(&self) -> i64 {
         self.session().now
+    }
+    fn seat(&self) -> usize {
+        self.session().seat
     }
     fn view(&self, _: &dyn ClientHost) -> Option<View> {
         let session = self.session();
@@ -378,6 +393,8 @@ fn hooks_drive_the_teacher() {
         .files
         .insert(progress_file.clone(), KEPT.into());
     io.session().unreadable.insert(progress_file.clone());
+    let config_file = (Store::Config, files::CONFIG_FILE.to_string());
+    io.session().files.insert(config_file, BAD_CONFIG.into());
     set_io(io.clone());
     let mods = vec![ModEntry::new("learnordie", crate::hooks())];
     with_mods(mods.into(), || {
@@ -385,7 +402,8 @@ fn hooks_drive_the_teacher() {
         let screen = screen_at([0.0, 0.0]);
 
         // The title screen: the pack loads and says so in the game's log (the mixin adds the
-        // `[learnordie]` target), the default config is written.
+        // `[learnordie]` target), the config that does not parse is set aside and the defaults
+        // are written in its place.
         tick(&mut host, &io, 50);
         let phrases = with_state(|teacher, _| teacher.map(|t| t.pack.phrases().len()));
         assert_eq!(phrases, Some(IDS.len()));
@@ -397,6 +415,9 @@ fn hooks_drive_the_teacher() {
             .file(Store::Config, files::CONFIG_FILE)
             .expect("config written");
         assert_eq!(config["enabled"], Value::Bool(true));
+        let saved = io.session().files.clone();
+        let aside = io.set_aside(Store::Config, files::CONFIG_FILE, BAD_CONFIG);
+        assert!(aside, "{:?}", saved.keys());
 
         // A world: the item in hand on joining is not said; the next one is, on the voice.
         io.session().view = Some(View {
@@ -435,6 +456,19 @@ fn hooks_drive_the_teacher() {
                 .iter()
                 .any(|s| s == "zhnarrator_de:gui/teacher")
         );
+
+        // A split-screen player's turn: its game shares this process, but its hooks leave the
+        // teacher alone. Picking its profile it is in no world, which does not take him out of
+        // this window's world, and its view gets no HUD.
+        let own = io.session().view.take();
+        io.session().seat = 1;
+        tick(&mut host, &io, 50);
+        let mut canvas = Canvas::default();
+        mod_api::dispatch_gui_layer_draw(&host, LAYER, &mut canvas);
+        io.session().seat = 0;
+        io.session().view = own;
+        assert_eq!(with_state(|_, game| game.level), Some(1), "left the world");
+        assert!(canvas.sprites.is_empty(), "{:?}", canvas.sprites);
 
         // A block that breaks at once (creative, grass, torches): the attack key acts on it and
         // it is gone by the tick's end, though it was never mined. Said once.
@@ -500,7 +534,7 @@ fn hooks_drive_the_teacher() {
         }
         assert!(io.said("place.bloop"));
 
-        // A question a full interval after she first spoke: the ding, the screen, the pause.
+        // A question a full interval after he first spoke: the ding, the screen, the pause.
         next_question(&mut host, &io);
         assert_eq!(io.session().opened, 1);
         let ding = io
@@ -553,9 +587,7 @@ fn hooks_drive_the_teacher() {
         assert_eq!(correct, Some(1));
         // The file reads again: the earlier progress was set aside before a save replaced it.
         let saved = io.session().files.clone();
-        let aside = saved.iter().any(|((store, name), bytes)| {
-            *store == Store::Data && name.starts_with("progress-de.json.invalid-") && bytes == KEPT
-        });
+        let aside = io.set_aside(Store::Data, &files::progress_file("de"), KEPT);
         assert!(aside, "{:?}", saved.keys());
         let filed = |key: &str| {
             let progress = io.file(Store::Data, &files::progress_file("de"));
@@ -606,7 +638,7 @@ fn hooks_drive_the_teacher() {
         tick(&mut host, &io, 5000);
         assert!(filed("save:Testwelt:0"));
 
-        // The toggle key turns her off, says so in chat, and the config file keeps it.
+        // The toggle key turns him off, says so in chat, and the config file keeps it.
         io.session().clicks.push(keys::TOGGLE);
         tick(&mut host, &io, 50);
         let config = io

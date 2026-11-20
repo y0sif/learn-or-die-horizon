@@ -1,5 +1,5 @@
-//! The teacher's HUD layer (Java `NarratorHud`, the pilot's parts): her portrait in a corner with
-//! the lipsync mouth, the held item's noun over the hotbar, and the phrase she says in words
+//! The teacher's HUD layer (Java `NarratorHud`, the pilot's parts): his portrait in a corner with
+//! the lipsync mouth, the held item's noun over the hotbar, and the phrase he says in words
 //! coloured by their grammatical role with its translation under it.
 //!
 //! Scaled text goes through one `gui_paint` batch per block, as the SDK's pose (`GuiDraw::Push`)
@@ -84,7 +84,7 @@ pub(crate) fn draw(_host: &dyn ClientHost, event: &mut GuiLayerDrawEvent<'_>) {
 }
 
 /// `renderPortrait`: the frame the core picks, at `hudPortraitScale` in half steps, standing on the
-/// screen's edge from her waist up, showing more of her while she hops.
+/// screen's edge from his waist up, showing more of him while he hops.
 fn portrait(draw: &mut dyn DrawContext, teacher: &mut Teacher, now: i64, [w, h]: [f32; 2]) {
     let corner = teacher.config.hud_portrait.clone();
     if !teacher.config.on() || corner == "off" {

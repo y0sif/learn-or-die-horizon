@@ -82,6 +82,8 @@ pub struct Click {
 pub trait Client: Send + Sync {
     /// Wall-clock time in ms since the epoch, the clock the core and the progress file use.
     fn now(&self) -> i64;
+    /// Whose game the hook runs for: 0 for this window's own, 1 for split-screen P2 and so on.
+    fn seat(&self) -> usize;
     /// The local player and the window this tick; `None` outside a world.
     fn view(&self, host: &dyn ClientHost) -> Option<View>;
     /// The block id at `pos` in the client level; `None` for an unloaded chunk.
@@ -166,6 +168,10 @@ impl Client for HostClient {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64)
+    }
+
+    fn seat(&self) -> usize {
+        super::seat()
     }
 
     fn view(&self, host: &dyn ClientHost) -> Option<View> {

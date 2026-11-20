@@ -3,9 +3,14 @@
 //! keeps the state and runs the client tick.
 //!
 //! State lives in one process-wide mutex. The two native mixins (`src/mixins/`) run inside game
-//! functions with no host, so what they read is kept in atomics. Every client read and write goes
-//! through [`client::Client`], one seam the wiring test answers, as the SDK's fake host has no
+//! functions with no host, so what they share with the layer is kept in statics of its own: the
+//! pause and shared flags, the queued log lines and the seat reader. Every client read and write
+//! goes through [`client::Client`], one seam the wiring test answers, as the SDK's fake host has no
 //! client backend.
+//!
+//! Split-screen players each run a `Game` of their own in this process, so they share these
+//! statics and the one teacher. The client hooks act only for this window's own game, seat 0
+//! ([`hosting`]); the other seats' games get nothing from the mod.
 pub mod client;
 pub(crate) mod detect;
 mod files;
@@ -22,7 +27,7 @@ use crate::core::{Outcome, Pictures, QuizEvent, Teacher};
 use client::{Client, HostClient, View};
 use mod_api::{ClientHost, SoundRef, Text};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 pub const MOD_ID: &str = "learnordie";
 
@@ -49,13 +54,33 @@ pub fn take_escape_pause() -> bool {
 }
 
 /// For the `quiz_pause` mixin: whether the integrated server is open to LAN or has split-screen
-/// players joined.
+/// players joined. Only this window's own game's frame sets it.
 pub fn set_shared(shared: bool) {
     SHARED.store(shared, Ordering::Relaxed);
 }
 
 pub(crate) fn shared() -> bool {
     SHARED.load(Ordering::Relaxed)
+}
+
+/// The engine's `horizon_hooks::seat`: whose turn it is on the game's thread, 0 for this window's
+/// own player, 1 for split-screen P2 and so on. The mod's crate cannot name the engine's crates;
+/// the `quiz_pause` mixin, compiled against them, hands it over on the first frame.
+static SEAT: OnceLock<fn() -> usize> = OnceLock::new();
+
+/// For the `quiz_pause` mixin: the engine's reader of the current seat.
+pub fn set_seat(seat: fn() -> usize) {
+    let _ = SEAT.set(seat);
+}
+
+/// The seat whose turn it is; 0 until the first frame, before any split-screen player can join.
+pub(crate) fn seat() -> usize {
+    SEAT.get().map_or(0, |seat| seat())
+}
+
+/// The hook runs for this window's own game, not a split-screen player's.
+pub(crate) fn hosting() -> bool {
+    io().seat() == 0
 }
 
 /// The game's log (`logs/latest.log`) is written by the game's own `log` crate. A mod's `log`
@@ -210,7 +235,7 @@ pub(crate) fn logging_out(host: &mut dyn ClientHost) {
     QUIZ_PAUSES.store(false, Ordering::Relaxed);
 }
 
-/// A resource reload finished: the teacher is built again from the pack, keeping her config and
+/// A resource reload finished: the teacher is built again from the pack, keeping his config and
 /// progress, and joins the level again.
 fn reload(
     host: &dyn ClientHost,
@@ -241,7 +266,7 @@ fn reload(
     }
 }
 
-/// The player left the world: the progress is saved, her voice stopped and the trackers
+/// The player left the world: the progress is saved, his voice stopped and the trackers
 /// forgotten.
 fn leave(host: &dyn ClientHost, io: &dyn Client, teacher: &mut Teacher, game: &mut Game, now: i64) {
     game.seed_wait = None;

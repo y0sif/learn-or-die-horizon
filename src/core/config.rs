@@ -139,7 +139,7 @@ impl Config {
         mod_api::serde_json::to_string_pretty(&self.to_json()).unwrap_or_default()
     }
 
-    /// The teacher is on. Lesson-map worlds, which also silence her, are not ported.
+    /// The teacher is on. Lesson-map worlds, which also silence him, are not ported.
     pub fn on(&self) -> bool {
         self.enabled
     }

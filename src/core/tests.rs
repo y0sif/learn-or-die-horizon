@@ -16,9 +16,11 @@ const PHRASES: &str = r#"{
     {"key": "zang", "kind": "block", "patterns": ["zang"]},
     {"key": "stein", "kind": "block", "patterns": ["stone"]},
     {"key": "allstein", "kind": "block", "patterns": ["*stone*"]},
+    {"key": "fels", "kind": "block", "patterns": ["stone"]},
     {"key": "kerzenkuchen", "kind": "block", "patterns": ["*candle*cake"]},
     {"key": "quux", "kind": "item", "patterns": ["quux"]},
-    {"key": "palin", "kind": "item", "patterns": ["ab*ba"]}
+    {"key": "palin", "kind": "item", "patterns": ["ab*ba"]},
+    {"key": "muh", "kind": "entity", "patterns": ["cow", "mooshroom"]}
   ],
   "phrases": [
     {"id": "break.bloop", "action": "break", "key": "bloop", "text": "Ich zerbreche den Bloop.", "en": "I break the bloop.",
@@ -50,6 +52,14 @@ const LIPSYNC: &str = r#"{"window": 40, "clips": {
 const WORLD: &str = "save:Testwelt:2a";
 const START: i64 = 1_000_000;
 const HEARD: &[&str] = &["break.bloop", "hold.quux", "pickup.quux"];
+/// An item registry, in registry order, for the questions' pictures.
+const REGISTRY: [&str; 5] = [
+    "minecraft:stone",
+    "minecraft:red_bloop",
+    "minecraft:bloop",
+    "minecraft:mooshroom_spawn_egg",
+    "minecraft:cow_spawn_egg",
+];
 
 fn fixture_pack(language: &str) -> Pack {
     Pack::parse("zhnarrator_xx", PHRASES, Some(LIPSYNC), language).expect("the fixture pack parses")
@@ -108,13 +118,16 @@ enum Lookup {
     Use,
     /// The translation of this phrase id with this hint language.
     Hint(&'static str),
+    /// The item a question about this word key shows, from [`REGISTRY`].
+    Picture,
 }
 
 #[test]
 fn registry_ids_find_their_word_and_phrase() {
     let pack = fixture_pack("en");
+    let pictures = pack.pictures(REGISTRY.map(str::to_string).to_vec());
     #[rustfmt::skip]
-    let rows: [(&str, Lookup, &str, Option<&str>); 22] = [
+    let rows: [(&str, Lookup, &str, Option<&str>); 26] = [
         ("an exact pattern", Lookup::Key("block"), "minecraft:bloop", Some("bloop")),
         ("a star prefix", Lookup::Key("block"), "minecraft:red_bloop", Some("bloop")),
         ("the star keeps the underscore", Lookup::Key("block"), "minecraft:redbloop", None),
@@ -137,6 +150,10 @@ fn registry_ids_find_their_word_and_phrase() {
         ("a block with no use phrase", Lookup::Use, "minecraft:bloop", None),
         ("a hint replaces the English", Lookup::Hint("es"), "break.bloop", Some("Rompo el bloop.")),
         ("no hint keeps the English", Lookup::Hint("pt"), "break.bloop", Some("I break the bloop.")),
+        ("a picture is the first registry item the key maps", Lookup::Picture, "bloop", Some("minecraft:red_bloop")),
+        ("an exact pattern names an item an earlier word took", Lookup::Picture, "fels", Some("minecraft:stone")),
+        ("then the lowest spawn egg of the entity's names", Lookup::Picture, "muh", Some("minecraft:mooshroom_spawn_egg")),
+        ("no item and no egg, no picture", Lookup::Picture, "zang", None),
     ];
     for (name, lookup, id, expected) in rows {
         let got: Option<String> = match lookup {
@@ -145,6 +162,7 @@ fn registry_ids_find_their_word_and_phrase() {
             Lookup::Break(held) => break_phrase(&pack, held, id).map(|p| p.id.clone()),
             Lookup::Use => pack.use_phrase(id, false).map(|p| p.id.clone()),
             Lookup::Hint(language) => fixture_pack(language).phrase(id).map(|p| p.en.clone()),
+            Lookup::Picture => pack.picture(id, &pictures).map(str::to_string),
         };
         assert_eq!(got.as_deref(), expected, "{name}");
     }

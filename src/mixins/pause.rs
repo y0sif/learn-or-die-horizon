@@ -6,6 +6,10 @@ fn quiz_pause(value: bool, game: &Game<'_>) -> bool {
             ::log::info!(target: "learnordie", "{text}");
         }
     }
+    mod_learnordie::game::set_seat(::horizon_hooks::seat);
+    if game.options.split_guest {
+        return value;
+    }
     let shared = game.is_published() || game.has_split_players();
     mod_learnordie::game::set_shared(shared);
     value

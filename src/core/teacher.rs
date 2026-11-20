@@ -158,7 +158,7 @@ impl Teacher {
         self.speaker.take_commands()
     }
 
-    /// The player left the world: her clip stops and what is queued is dropped, so none of it is
+    /// The player left the world: his clip stops and what is queued is dropped, so none of it is
     /// said in the next world. Returns the sound commands to run.
     pub fn left_world(&mut self, now: i64) -> Vec<SoundCommand> {
         self.speaker.stop(now);
@@ -172,14 +172,14 @@ impl Teacher {
             .say_sequence(display, clips, fresh, &self.config, &self.progress, now);
     }
 
-    /// The teacher key: on or off. Stops her sound. Returns whether she is on now.
+    /// The teacher key: on or off. Stops his sound. Returns whether he is on now.
     pub fn toggle_teacher(&mut self, now: i64) -> bool {
         self.config.enabled = !self.config.enabled;
         self.speaker.stop(now);
         self.config.enabled
     }
 
-    /// The mute key: her sound off or on; text and questions stay. Returns whether she is muted.
+    /// The mute key: his sound off or on; text and questions stay. Returns whether he is muted.
     pub fn toggle_mute(&mut self, now: i64) -> bool {
         self.config.muted = !self.config.muted;
         if self.config.muted {

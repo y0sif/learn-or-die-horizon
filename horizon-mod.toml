@@ -11,7 +11,8 @@ homepage = "https://learnordie.me"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside data/ and assets/.
 api = "0.2"
 side = "both"
-# registries: "May add blocks, items, mob effects and entity types to your worlds".
+# Required: the field has no default, and a content mod must list exactly "registries". The mod registers
+# nothing in the game's registries (no blocks, items, mob effects or entity types).
 capabilities = ["registries"]
 # The German pack (phrases, lipsync, voices, portrait) keeps the original's namespace; its files come from
 # the original jar's layer, not this package. `learnordie` holds the port's own UI strings.
@@ -28,7 +29,9 @@ mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
 # Minecraft.pause itself checks. Run every frame, it also tells the mod whether the world is shared that way
 # (no API does), so the quiz waits there as the original's does on LAN, and writes the mod's queued log lines
 # with the game's own `log` crate, so they reach logs/latest.log (a mod's `log` dependency would be a separate
-# copy that the game's logger never hears).
+# copy that the game's logger never hears). Split-screen players' games run in this process and share the mod:
+# it hands the mod the engine's seat reader (`horizon_hooks::seat`, which the mod's crate cannot name), so the
+# mod's client hooks act only for this window's own game, and only that game's frame sets the shared flag.
 [[native.mixin]]
 id = "quiz_pause"
 target = "horizon_client::game::pointer_capture::Game<'_>::pauses_game"
