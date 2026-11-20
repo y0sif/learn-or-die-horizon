@@ -55,6 +55,59 @@ bindings = [
   { name = "game", ty = "&mut Game<'_>", value = "&mut *self" },
 ]
 
+# A controller's B and Start are Escape (docs/controllers.md), but on a mod's screen they only close it
+# (`pad_back` -> `key_pressed(Escape)` -> `close_mod_screen`): the screen's Escape key hook never hears
+# them, so a question was dropped instead of suspended and a settings page or the guide closed instead of
+# going back. This asks this mod's screen's Escape hook first, as the window's Escape does; when the
+# screen takes it, that is all.
+[[native.mixin]]
+id = "pad_escape"
+target = "horizon_client::game::pad::Game<'_>::pad_back"
+kind = "HEAD"
+cancellable = true
+helper = "src/mixins/pad_escape.rs"
+bindings = [{ name = "game", ty = "&mut Game<'_>", value = "&mut *self" }]
+
+# A on a text field opens the controller's on-screen keyboard, which types into the game's own fields
+# only: over a mod's screen its keys do nothing and the next press closes it. Over this mod's typed
+# question and dictionary its letters go to the screen's character hook and Backspace and Done (Enter)
+# to its key hook, as the keyboard's do, and Done closes it.
+[[native.mixin]]
+id = "pad_typing"
+target = "horizon_client::game::pad_menu::Game<'_>::pad_osk_output"
+kind = "HEAD"
+cancellable = true
+helper = "src/mixins/pad_typing.rs"
+bindings = [
+  { name = "game", ty = "&mut Game<'_>", value = "&mut *self" },
+  { name = "out", ty = "&osk::Output", value = "&out" },
+]
+
+[[native.mixin]]
+id = "pad_typing_screen"
+target = "horizon_client::game::pad_menu::Game<'_>::pad_has_typing_screen"
+kind = "RETURN"
+helper = "src/mixins/pad_typing_screen.rs"
+bindings = [
+  { name = "value", ty = "bool", value = "$value" },
+  { name = "game", ty = "&Game<'_>", value = "&*self" },
+]
+
+# A mod's screen registers controller targets only as buttons and text fields (`widget_button`,
+# `widget_text_field`). A settings slider as a button gets A as a click at its middle, which sets the middle
+# value, and left and right move away from it. Registered again as a slider (`Kind::Slider`, which the
+# game merges with the button of the same rectangle), A takes hold of it and left and right move it by
+# clicks along its track, as on the game's own sliders.
+[[native.mixin]]
+id = "pad_sliders"
+target = "horizon_client::game::native_hooks::Game<'_>::screen_render_end"
+kind = "RETURN"
+helper = "src/mixins/pad_sliders.rs"
+bindings = [
+  { name = "value", ty = "()", value = "$value" },
+  { name = "game", ty = "&Game<'_>", value = "&*self" },
+]
+
 # The official Learn or Die German jar, recorded by `cargo horizon-mod use-jar`. Its assets (the pack, voices,
 # portrait) layer below this package's own; nothing of it is copied into the repo or the .hmod.
 

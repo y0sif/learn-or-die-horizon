@@ -11,10 +11,15 @@
 //!
 //! The input hooks' host only reads, so an answer is recorded here and the next client tick
 //! closes the screen and writes the chat line.
+//!
+//! A controller reaches every page through the game: B and Start ask the Escape hook (the
+//! `pad_escape` mixin), the on-screen keyboard types into a page with a text field (`pad_typing`)
+//! and the settings' sliders are its sliders (`pad_sliders`). Its A and right stick reach the
+//! click and wheel hooks only where the game lets a controller's clicks through to a mod's screen.
 use super::hud::{self, GOLD, frame, panel, width};
 use super::{
-    ESCAPE_PAUSE, Game, QUIZ_PAUSES, STATE, State, dictionary, guide, lock, number, settings,
-    sound, typing,
+    ESCAPE_PAUSE, Game, PAD_SLIDERS, PAD_TEXT, QUIZ_PAUSES, STATE, State, dictionary, guide, lock,
+    number, settings, sound, typing,
 };
 use crate::core::{ExamStage, OpenQuestion, Phrase, QuestionKind, Teacher};
 use mod_api::client::hud_layout::PoseOp;
@@ -243,6 +248,16 @@ pub(super) fn timer(
     draw.text(&timer, [bar_right + 6.0, mid - 24.0], colour, true);
 }
 
+/// The page showing has a text field: the dictionary's search box or the typed question's box.
+fn has_text_field(teacher: &Teacher, game: &Game) -> bool {
+    if game.settings.is_some() || game.result.is_some() {
+        return false;
+    }
+    game.dictionary.is_some()
+        || (game.guide.is_none()
+            && showing(teacher).is_some_and(|open| open.kind == QuestionKind::Typing))
+}
+
 /// `extractRenderState` of the screen showing.
 pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
     let io = super::io();
@@ -257,6 +272,8 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
     let Some(teacher) = teacher.as_ref() else {
         return;
     };
+    PAD_TEXT.store(has_text_field(teacher, game), Ordering::Relaxed);
+    lock(&PAD_SLIDERS).clear();
     let draw = &mut *event.draw;
     if game.settings.is_some() {
         settings::render(host, io, draw, teacher, game, mouse);

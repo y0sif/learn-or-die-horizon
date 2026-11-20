@@ -3,9 +3,10 @@
 //! the files and the world key each have a module; this one keeps the state and runs the client
 //! tick.
 //!
-//! State lives in one process-wide mutex. The two native mixins (`src/mixins/`) run inside game
+//! State lives in one process-wide mutex. The native mixins (`src/mixins/`) run inside game
 //! functions with no host, so what they share with the layer is kept in statics of its own: the
-//! pause and shared flags, the queued log lines and the seat reader. Every client read and write
+//! pause and shared flags, the queued log lines, the seat reader and what the controller's mixins
+//! read of the screen drawn. Every client read and write
 //! goes through [`client::Client`], one seam the wiring test answers, as the SDK's fake host has no
 //! client backend.
 //!
@@ -125,6 +126,30 @@ pub(crate) fn log_warn(text: String) {
 /// `(warning, text)`.
 pub fn take_log_lines() -> Vec<(bool, String)> {
     std::mem::take(&mut *lock(&LOG_LINES))
+}
+
+/// The screen last drawn has a text field: the typed question or the dictionary. Set by every
+/// draw of this mod's screen; the pad mixins read it, never the state's mutex.
+static PAD_TEXT: AtomicBool = AtomicBool::new(false);
+
+/// A settings slider as a controller's focus takes it: the row's button, the value its handle
+/// shows (0 to 1) and the track a click spans from 0 to 1, `[x, width]`.
+pub type PadSlider = ([f32; 4], f32, [f32; 2]);
+
+/// The sliders the last draw of this mod's screen showed, until the `pad_sliders` mixin takes them.
+static PAD_SLIDERS: Mutex<Vec<PadSlider>> = Mutex::new(Vec::new());
+
+/// For the `pad_typing` mixins: the controller's on-screen keyboard types into this mod's screen,
+/// open (`mod_screen`) and showing a text field. The game's keyboard types nothing into a mod's
+/// screen and closes over one.
+pub fn pad_typing(mod_screen: Option<&str>) -> bool {
+    mod_screen == Some(MOD_ID) && PAD_TEXT.load(Ordering::Relaxed)
+}
+
+/// For the `pad_sliders` mixin: this frame's sliders, to register as the controller's slider
+/// targets (A takes hold, left and right move it), as a mod can only register buttons.
+pub fn pad_sliders() -> Vec<PadSlider> {
+    std::mem::take(&mut *lock(&PAD_SLIDERS))
 }
 
 /// What the layer keeps beside the teacher.
