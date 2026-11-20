@@ -260,7 +260,8 @@ impl Detector {
         }
     }
 
-    /// Items whose total count rose since the last tick, while no screen is open.
+    /// Items whose total count rose since the last tick, while no screen is open. A tick whose
+    /// inventory could not be read is skipped, keeping the last counts.
     fn pickups(
         &mut self,
         input: &WorldTick<'_>,
@@ -268,8 +269,11 @@ impl Detector {
         config: &Config,
         out: &mut Vec<Speech>,
     ) {
+        let Some(inventory) = input.inventory else {
+            return;
+        };
         let mut counts: Vec<(String, i32)> = Vec::new();
-        for &(item, count) in input.inventory {
+        for &(item, count) in inventory {
             if is_empty_item(item, count) {
                 continue;
             }

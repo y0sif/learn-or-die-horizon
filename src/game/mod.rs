@@ -32,6 +32,9 @@ static QUIZ_PAUSES: AtomicBool = AtomicBool::new(false);
 /// Esc has just suspended the question: the `quiz_escape` mixin opens the pause menu once Escape
 /// has closed the screen, as the original's `onClose` does. Cleared every client tick.
 static ESCAPE_PAUSE: AtomicBool = AtomicBool::new(false);
+/// The integrated server is open to LAN (Java `IntegratedServer.isPublished`), as the
+/// `quiz_pause` mixin sees it every frame: no API tells a mod.
+static PUBLISHED: AtomicBool = AtomicBool::new(false);
 
 /// For the `quiz_pause` mixin: the question screen asks the game to pause.
 pub fn quiz_pauses() -> bool {
@@ -42,6 +45,48 @@ pub fn quiz_pauses() -> bool {
 /// Esc. True once.
 pub fn take_escape_pause() -> bool {
     ESCAPE_PAUSE.swap(false, Ordering::Relaxed)
+}
+
+/// For the `quiz_pause` mixin: whether the integrated server is open to LAN.
+pub fn set_published(published: bool) {
+    PUBLISHED.store(published, Ordering::Relaxed);
+}
+
+pub(crate) fn published() -> bool {
+    PUBLISHED.load(Ordering::Relaxed)
+}
+
+/// The game's log (`logs/latest.log`) is written by the game's own `log` crate. A mod's `log`
+/// dependency is a separate copy (registry crates are never the SDK's), whose logger the game
+/// never sets, and stderr is not in that log. So the mod queues its lines, `(warning, text)`, and the
+/// `quiz_pause` mixin, compiled against the game's crates, logs them every frame under the
+/// target `learnordie`: `[learnordie] <text>`.
+static LOG_LINES: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
+/// Lines kept while nothing takes them (a dedicated server has no frames): the newest win.
+const LOG_LINES_KEPT: usize = 256;
+
+fn log_line(warning: bool, text: String) {
+    let mut lines = lock(&LOG_LINES);
+    if lines.len() >= LOG_LINES_KEPT {
+        lines.remove(0);
+    }
+    lines.push((warning, text));
+}
+
+/// An info line for the game's log.
+pub(crate) fn log_info(text: String) {
+    log_line(false, text);
+}
+
+/// A warning for the game's log.
+pub(crate) fn log_warn(text: String) {
+    log_line(true, text);
+}
+
+/// For the `quiz_pause` mixin: the lines waiting for the game's log, oldest first, each
+/// `(warning, text)`.
+pub fn take_log_lines() -> Vec<(bool, String)> {
+    std::mem::take(&mut *lock(&LOG_LINES))
 }
 
 /// What the layer keeps beside the teacher.
@@ -55,8 +100,10 @@ pub(crate) struct Game {
     level: Option<u64>,
     /// When a single-player join began waiting for the seed.
     seed_wait: Option<i64>,
-    /// The block the player went for last tick.
+    /// The block the player was mining last tick.
     target: Option<detect::Target>,
+    /// The blocks the attack key acted on this tick, for its end.
+    attacked: Vec<detect::Target>,
     pending_place: Option<detect::PendingPlace>,
     /// The teacher's last sound.
     sound: Option<SoundRef>,
@@ -64,8 +111,6 @@ pub(crate) struct Game {
     outcomes: Vec<Outcome>,
     /// The question id and the item drawn for it.
     picture: Option<(String, Option<String>)>,
-    /// A key's notice and when it came.
-    notice: Option<(String, i64)>,
     /// The question screen's size when last drawn, for its clicks.
     screen_size: [f32; 2],
 }
@@ -124,11 +169,12 @@ pub(crate) fn client_tick(host: &mut dyn ClientHost) {
         QUIZ_PAUSES.store(false, Ordering::Relaxed);
         return;
     };
-    keys::handle(host, io, teacher, game, now);
+    keys::handle(host, io, teacher, now);
     let mut opened = false;
     if join(teacher, game, &view, now) && !view.paused {
         opened = world_tick(host, io, teacher, game, &view, now);
     }
+    game.attacked.clear();
     if view.our_screen
         && question_up(teacher)
         && let Some(outcome) = teacher.question_tick(now)
@@ -185,10 +231,11 @@ fn reload(
             game.items = items;
             game.level = None;
             game.target = None;
+            game.attacked.clear();
             game.pending_place = None;
             game.picture = None;
         }
-        Err(e) => eprintln!("[{MOD_ID}] the teacher stays away: {e}"),
+        Err(e) => log_warn(format!("the teacher stays away: {e}")),
     }
 }
 
@@ -201,6 +248,7 @@ fn leave(host: &dyn ClientHost, io: &dyn Client, teacher: &mut Teacher, game: &m
     let language = &teacher.pack.meta.language;
     files::save_progress(host, io, &mut teacher.progress, language, now);
     game.target = None;
+    game.attacked.clear();
     game.pending_place = None;
     game.outcomes.clear();
     game.picture = None;
@@ -220,6 +268,7 @@ fn join(teacher: &mut Teacher, game: &mut Game, view: &View, now: i64) -> bool {
     game.seed_wait = None;
     game.level = Some(view.level);
     game.target = None;
+    game.attacked.clear();
     game.pending_place = None;
     teacher.joined_level(now, &key, &view.dimension, &view.held_item);
     true
@@ -235,17 +284,20 @@ fn world_tick(
     view: &View,
     now: i64,
 ) -> bool {
-    if let Some((block, held)) = detect::poll_break(&*host, io, view, &mut game.target) {
+    let broken = detect::poll_break(&*host, io, view, &mut game.target, &mut game.attacked);
+    for (block, held) in broken {
         teacher.block_broken(now, &block, &held);
     }
     detect::check_place(&*host, io, &mut game.pending_place, teacher, now);
-    let inventory: Vec<(&str, i32)> = view
-        .inventory
-        .iter()
-        .map(|(item, count)| (item.as_str(), *count))
-        .collect();
+    let inventory: Option<Vec<(&str, i32)>> = view.inventory.as_ref().map(|stacks| {
+        stacks
+            .iter()
+            .map(|(item, count)| (item.as_str(), *count))
+            .collect()
+    });
     let breaking = detect::mining(game.target.as_ref());
-    let event = teacher.world_tick(&detect::world_tick(view, &inventory, breaking, now));
+    let input = detect::world_tick(view, inventory.as_deref(), breaking, now);
+    let event = teacher.world_tick(&input);
     match event {
         Some(QuizEvent::Ask) => {
             sound::ding(&*host, io);

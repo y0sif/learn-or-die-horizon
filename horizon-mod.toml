@@ -19,7 +19,10 @@ mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
 
 # A mod screen never pauses single player (Screen::Mod is not a pause screen). The original's QuizScreen
 # does when `quizPauseGame` is on (`isPauseScreen`): this adds "the question screen is up and asks to pause"
-# to Minecraft.pause, still for single player only, not published to LAN.
+# to Minecraft.pause, still for single player only, not published to LAN. Run every frame, it also tells
+# the mod whether the world is open to LAN (no API does), so the quiz waits there as the original's does,
+# and writes the mod's queued log lines with the game's own `log` crate, so they reach logs/latest.log
+# (a mod's `log` dependency would be a separate copy that the game's logger never hears).
 [[native.mixin]]
 id = "quiz_pause"
 target = "horizon_client::game::pointer_capture::Game<'_>::pauses_game"

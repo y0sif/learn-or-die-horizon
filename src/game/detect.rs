@@ -1,22 +1,21 @@
 //! What the player did, read on the client as the original reads it: the block they broke (no
-//! client event, so polled), the block they placed (a right click with a block item, then the
-//! block showing up within 500 ms), and the tick's state for the core's detector (held item,
+//! client break event: the blocks the attack key acted on, and the block being mined, gone by
+//! the tick's end), the block they placed (a right click with a block item, then the block
+//! showing up within 500 ms), and the tick's state for the core's detector (held item,
 //! inventory for pickups, the block being mined).
 use super::client::{Client, View};
 use super::{STATE, State, lock};
 use crate::core::{Teacher, WorldTick};
-use mod_api::{BlockClick, ClientHost};
+use mod_api::{BlockClick, ClientHost, InteractionKey};
 
 const PLACE_WAIT_MS: i64 = 500;
 
-/// The block the player went for last tick, and what they held.
+/// A block the player went for, and what they held.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Target {
     pos: [i32; 3],
     block: String,
     held: String,
-    /// The client was mining it (not only aiming at it with attack held).
-    mining: bool,
 }
 
 /// A right click with a block item, waiting for its block (Java `PendingPlace`).
@@ -37,46 +36,71 @@ fn is_gone(block: &str) -> bool {
             | "minecraft:void_air"
             | "minecraft:water"
             | "minecraft:lava"
+            | "minecraft:bubble_column"
     )
 }
 
-/// The block the player broke since the last tick, and the item they held: last tick's target is
-/// air or a fluid now. The target is the block being mined, or the block aimed at while attack is
-/// held, which covers blocks that break at once (grass, torches, creative mode).
+/// The attack key acts on the crosshair's block this tick (Java's client break event has no
+/// counterpart): a click, or the key held digging on. The block is kept for the tick's end,
+/// which counts it if it is gone, so a block that breaks at once is heard too (creative mode,
+/// and grass, flowers, torches or crops by hand), though it never starts mining.
+pub(crate) fn attack(host: &dyn ClientHost, key: InteractionKey) {
+    if key != InteractionKey::Attack {
+        return;
+    }
+    let io = super::io();
+    let Some((pos, held)) = io.attack_target(host) else {
+        return;
+    };
+    let Some(block) = io.block_at(host, pos).filter(|block| !is_gone(block)) else {
+        return;
+    };
+    let mut state = lock(&STATE);
+    let State { teacher, game } = &mut *state;
+    if teacher.is_none() || game.level.is_none() {
+        return;
+    }
+    if !game.attacked.iter().any(|target| target.pos == pos) {
+        game.attacked.push(Target { pos, block, held });
+    }
+}
+
+/// The blocks the player broke this tick, each with the item they held: a block the attack key
+/// acted on this tick, or the block mined last tick, that is air or a fluid now. A block both
+/// mined and attacked counts once. Then the block being mined now becomes the next target.
 pub(crate) fn poll_break(
     host: &dyn ClientHost,
     io: &dyn Client,
     view: &View,
     target: &mut Option<Target>,
-) -> Option<(String, String)> {
-    let broken = target.take().filter(|last| {
-        io.block_at(host, last.pos)
-            .is_some_and(|now| now != last.block && is_gone(&now))
-    });
-    let next = match view.mining {
-        Some(pos) => Some((pos, true)),
-        None => view
-            .aimed
-            .filter(|_| view.attack_down)
-            .map(|pos| (pos, false)),
-    };
-    *target = next.and_then(|(pos, mining)| {
+    attacked: &mut Vec<Target>,
+) -> Vec<(String, String)> {
+    let mut broken: Vec<Target> = Vec::new();
+    for last in target.take().into_iter().chain(attacked.drain(..)) {
+        let gone = io
+            .block_at(host, last.pos)
+            .is_some_and(|now| now != last.block && is_gone(&now));
+        if gone && !broken.iter().any(|seen| seen.pos == last.pos) {
+            broken.push(last);
+        }
+    }
+    *target = view.mining.and_then(|pos| {
         let block = io.block_at(host, pos).filter(|block| !is_gone(block))?;
         Some(Target {
             pos,
             block,
             held: view.held_item.clone(),
-            mining,
         })
     });
-    broken.map(|last| (last.block, last.held))
+    broken
+        .into_iter()
+        .map(|last| (last.block, last.held))
+        .collect()
 }
 
 /// The block being mined, for the core's ongoing state.
 pub(crate) fn mining(target: Option<&Target>) -> Option<&str> {
-    target
-        .filter(|target| target.mining)
-        .map(|target| target.block.as_str())
+    target.map(|target| target.block.as_str())
 }
 
 /// A right click on a block, on the client (Java `onUseBlock`): a click the pack has a use
@@ -134,7 +158,7 @@ pub(crate) fn check_place(
 /// The core's input for one world tick.
 pub(crate) fn world_tick<'a>(
     view: &'a View,
-    inventory: &'a [(&'a str, i32)],
+    inventory: Option<&'a [(&'a str, i32)]>,
     breaking: Option<&'a str>,
     now: i64,
 ) -> WorldTick<'a> {
@@ -149,7 +173,7 @@ pub(crate) fn world_tick<'a>(
         inventory,
         screen_open: view.screen_open,
         question_screen_open: view.our_screen,
-        singleplayer: view.singleplayer,
+        singleplayer: view.singleplayer && !view.published,
         dead: view.health <= 0.0,
         health: view.health,
         sleeping: view.sleeping,

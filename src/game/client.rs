@@ -4,7 +4,8 @@
 use super::MOD_ID;
 use mod_api::{
     BlockBreakingState, BlockClick, ClientHost, ConfigFileError, ConfigFiles, ConfigPath,
-    CrosshairTarget, Hand, Identifier, PackType, SoundPlay, SoundRef, SoundState, Text,
+    CrosshairTarget, EntityRef, EquipmentSlot, Hand, Identifier, PackType, SoundPlay, SoundRef,
+    SoundState, Text,
 };
 use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -24,8 +25,10 @@ pub struct View {
     /// The client level, as a hash of its handle: a new value is a new level object.
     pub level: u64,
     pub dimension: String,
-    /// This window owns the integrated server it plays on.
+    /// This window owns the integrated server it plays on (open to LAN or not).
     pub singleplayer: bool,
+    /// That integrated server is open to LAN (as the `quiz_pause` mixin last saw it).
+    pub published: bool,
     /// The save's folder under `saves/`, in single player.
     pub save_folder: Option<String>,
     /// The joined server's address, elsewhere.
@@ -41,13 +44,12 @@ pub struct View {
     pub using_item: bool,
     /// The block the player is mining (the client's predicted breaking target).
     pub mining: Option<[i32; 3]>,
-    /// The block under the crosshair.
-    pub aimed: Option<[i32; 3]>,
     /// The main-hand item id, empty when the hand is empty, and its count.
     pub held_item: String,
     pub held_count: i32,
-    /// The main inventory's stacks as `(item id, count)`.
-    pub inventory: Vec<(String, i32)>,
+    /// Every stack the player carries as `(item id, count)`: the main inventory, the off hand and
+    /// the worn armour (Java `Inventory.getContainerSize`). `None` when it could not be read.
+    pub inventory: Option<Vec<(String, i32)>>,
     pub health: f32,
     pub sleeping: bool,
     pub in_vehicle: bool,
@@ -83,6 +85,9 @@ pub trait Client: Send + Sync {
     fn view(&self, host: &dyn ClientHost) -> Option<View>;
     /// The block id at `pos` in the client level; `None` for an unloaded chunk.
     fn block_at(&self, host: &dyn ClientHost, pos: [i32; 3]) -> Option<String>;
+    /// What an attack acts on now: the block under the crosshair, and the main-hand item id
+    /// (empty for an empty hand). `None` when the crosshair is not on a block.
+    fn attack_target(&self, host: &dyn ClientHost) -> Option<([i32; 3], String)>;
     fn click(&self, host: &dyn ClientHost, click: &BlockClick<'_>) -> Option<Click>;
     /// This mod's screen is the one open.
     fn our_screen(&self, host: &dyn ClientHost) -> bool;
@@ -130,6 +135,21 @@ fn files(host: &dyn ClientHost, store: Store) -> &'static dyn ConfigFiles {
     }
 }
 
+/// The slots beside the main inventory that `Inventory.getContainerSize` counts.
+const WORN: [EquipmentSlot; 5] = [
+    EquipmentSlot::OffHand,
+    EquipmentSlot::Feet,
+    EquipmentSlot::Legs,
+    EquipmentSlot::Chest,
+    EquipmentSlot::Head,
+];
+
+fn main_hand_id(host: &dyn ClientHost, entity: EntityRef) -> String {
+    host.living(entity)
+        .and_then(|living| living.hand_item(host, Hand::Main))
+        .map_or_else(String::new, |stack| stack.item().id(host))
+}
+
 /// A property's value in a serialized state, `minecraft:oak_door[facing=north,open=true]`.
 pub(crate) fn property<'a>(state: &'a str, name: &str) -> Option<&'a str> {
     let inner = state.split_once('[')?.1.strip_suffix(']')?;
@@ -153,6 +173,15 @@ impl Client for HostClient {
         let entity = player.entity();
         let living = host.living(entity);
         let held = living.and_then(|l| l.hand_item(host, Hand::Main));
+        let inventory = player.inventory(host).map(|main| {
+            let worn = WORN
+                .iter()
+                .filter_map(|&slot| living.and_then(|l| l.equipment(host, slot)));
+            main.into_iter()
+                .chain(worn)
+                .map(|stack| (stack.item().id(host), stack.count() as i32))
+                .collect()
+        });
         let mut hasher = DefaultHasher::new();
         level.hash(&mut hasher);
         let server = host.client_session().client_server();
@@ -161,10 +190,6 @@ impl Client for HostClient {
             Some(BlockBreakingState::Breaking { position, .. }) => {
                 Some([position.x, position.y, position.z])
             }
-            _ => None,
-        };
-        let aimed = match host.crosshair_target() {
-            Some(CrosshairTarget::Block { pos, .. }) => Some([pos.x, pos.y, pos.z]),
             _ => None,
         };
         let [yaw, pitch] = entity.rotation(host).unwrap_or([0.0; 2]);
@@ -179,6 +204,7 @@ impl Client for HostClient {
                 .dimension(host)
                 .map_or_else(|| host.dimension().to_string(), |d| d.to_string()),
             singleplayer: server.as_ref().is_some_and(|s| s.integrated_local),
+            published: super::published(),
             save_folder: server.as_ref().and_then(|s| s.save_folder.clone()),
             address: server.and_then(|s| s.address),
             paused: host.is_paused(),
@@ -188,17 +214,11 @@ impl Client for HostClient {
             use_down: down("key.use"),
             using_item: host.local_item_use().is_some(),
             mining,
-            aimed,
             held_item: held
                 .as_ref()
                 .map_or_else(String::new, |stack| stack.item().id(host)),
             held_count: held.as_ref().map_or(0, |stack| stack.count() as i32),
-            inventory: player
-                .inventory(host)
-                .unwrap_or_default()
-                .iter()
-                .map(|stack| (stack.item().id(host), stack.count() as i32))
-                .collect(),
+            inventory,
             health: living.and_then(|l| l.health(host)).unwrap_or(20.0),
             sleeping: living.and_then(|l| l.is_sleeping(host)).unwrap_or(false),
             in_vehicle: entity.vehicle(host).is_some(),
@@ -214,6 +234,14 @@ impl Client for HostClient {
     fn block_at(&self, host: &dyn ClientHost, pos: [i32; 3]) -> Option<String> {
         let level = host.local_player()?.level(host)?;
         Some(level.block_state(host, pos)?.block().id(host))
+    }
+
+    fn attack_target(&self, host: &dyn ClientHost) -> Option<([i32; 3], String)> {
+        let Some(CrosshairTarget::Block { pos, .. }) = host.crosshair_target() else {
+            return None;
+        };
+        let player = host.local_player()?;
+        Some(([pos.x, pos.y, pos.z], main_hand_id(host, player.entity())))
     }
 
     fn click(&self, host: &dyn ClientHost, click: &BlockClick<'_>) -> Option<Click> {
@@ -276,7 +304,7 @@ impl Client for HostClient {
 
     fn chat(&self, host: &mut dyn ClientHost, line: Text) {
         if let Err(e) = host.chat_line(line) {
-            eprintln!("[{MOD_ID}] could not show a chat line: {e:?}");
+            super::log_warn(format!("could not show a chat line: {e:?}"));
         }
     }
 

@@ -6,10 +6,10 @@
 //! hands the client the world seed for the progress file's world key.
 use mod_api::{
     AddClientReloadListenersEvent, ClientHost, ClientPlayerLoggingOutEvent, ClientTickPostEvent,
-    Flow, GuiLayerDrawEvent, Hooks, HostSide, LogicalSide, RegisterGuiLayersEvent, Registrar,
-    RegistrationContext, RightClickBlockEvent, ScreenKeyPressedPreEvent,
-    ScreenMouseButtonPressedPreEvent, ScreenRenderPostEvent, ServerHost, ServerStartedEvent,
-    ServerStoppedEvent,
+    Flow, GuiLayerDrawEvent, Hooks, HostSide, InteractionKeyMappingTriggeredEvent, LogicalSide,
+    RegisterGuiLayersEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenRenderPostEvent, ServerHost,
+    ServerStartedEvent, ServerStoppedEvent,
 };
 
 pub mod core;
@@ -60,6 +60,17 @@ impl Hooks for Mod {
         _event: &mut ClientPlayerLoggingOutEvent,
     ) {
         game::logging_out(host);
+    }
+
+    /// The attack key acts on the crosshair's target: a block that breaks at once is counted at
+    /// the tick's end.
+    fn interaction_key_mapping_triggered(
+        &self,
+        host: &mut dyn ClientHost,
+        event: &mut InteractionKeyMappingTriggeredEvent,
+    ) -> Flow {
+        game::detect::attack(&*host, event.key);
+        Flow::Continue
     }
 
     /// The client's half of a right click on a block: the place check waits for the block.

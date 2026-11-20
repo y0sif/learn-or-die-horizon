@@ -202,13 +202,16 @@ fn describe(speech: &Speech) -> String {
     }
 }
 
-/// Each step is `<ms> <verb> [<name> [<count>]]`; every verb but `break` and `place` is a tick.
-/// The expected text lists what the step says, comma separated.
+/// Each step is `<ms> <verb> [<name> [<count>]]`; every verb but `break` and `place` is a tick,
+/// `unread` one whose inventory could not be read. The expected text lists what the step says,
+/// comma separated.
 #[test]
 fn freshness_decides_when_a_phrase_is_said_again() {
     let pack = fixture_pack("en");
+    // (name, repeatSeconds, steps as (step, said))
+    type Row = (&'static str, f32, &'static [(&'static str, &'static str)]);
     #[rustfmt::skip]
-    let rows: [(&str, f32, &[(&str, &str)]); 10] = [
+    let rows: [Row; 11] = [
         ("a first break is new, more with the button held are silent", 0.0, &[
             ("0 attack", ""), ("100 break bloop", "new break.bloop"), ("200 tick", ""),
             ("300 break bloop", ""),
@@ -238,6 +241,9 @@ fn freshness_decides_when_a_phrase_is_said_again() {
         ]),
         ("two items at once wait for counted sentences", 0.0, &[
             ("0 tick", ""), ("100 get quux 2", ""),
+        ]),
+        ("a tick that could not read the inventory is no pickup", 0.0, &[
+            ("0 get bloop 1", ""), ("100 unread", ""), ("200 tick", ""),
         ]),
         ("the held item is said on every change of item", 0.0, &[
             ("0 hold quux", "label hold.quux, repeat hold.quux"), ("100 tick", ""),
@@ -284,7 +290,7 @@ fn freshness_decides_when_a_phrase_is_said_again() {
                         "stop" => breaking = None,
                         "hold" => held = block(),
                         "get" => inventory.push((block(), words[3].parse().expect("a count"))),
-                        "tick" => {}
+                        "tick" | "unread" => {}
                         other => panic!("{name}: unknown verb {other}"),
                     }
                     let slots: Vec<(&str, i32)> = inventory
@@ -298,7 +304,7 @@ fn freshness_decides_when_a_phrase_is_said_again() {
                         breaking: breaking.as_deref(),
                         held_item: &held,
                         held_count: 1,
-                        inventory: &slots,
+                        inventory: (verb != "unread").then_some(&slots[..]),
                         ..WorldTick::default()
                     };
                     detector.tick(&input, &pack, &config)
@@ -458,8 +464,9 @@ fn an_open_question_runs_on_its_clock() {
 fn lipsync_gives_the_mouth_and_the_lengths() {
     let lipsync = Lipsync::parse(r#"{"clips": {"a": "1221000", "b": "000"}}"#).expect("parses");
     // (name, clip, ms, mouth, length, spoken); the window defaults to 40 ms.
+    type Row = (&'static str, &'static str, i64, i32, Option<i64>, i64);
     #[rustfmt::skip]
-    let rows: [(&str, &str, i64, i32, Option<i64>, i64); 10] = [
+    let rows: [Row; 10] = [
         ("the first window", "a", 0, 1, Some(280), 160),
         ("the end of the first window", "a", 39, 1, Some(280), 160),
         ("the second window", "a", 40, 2, Some(280), 160),
@@ -488,8 +495,9 @@ fn the_speaker_times_clips_by_their_lipsync() {
     let clips = [display.clone(), phrase(&teacher.pack, "hold.bloop")];
     teacher.say_sequence(&display, &clips, true, START);
     // (ms, clips started, speaking, mouth, portrait frame, text shown)
+    type Row = (i64, &'static [&'static str], bool, i32, i32, bool);
     #[rustfmt::skip]
-    let rows: [(i64, &[&str], bool, i32, i32, bool); 10] = [
+    let rows: [Row; 10] = [
         (0, &["pickup.bloop"], true, 0, 0, true),
         (100, &[], true, 2, 2, true),
         (210, &[], true, 0, 0, true),
@@ -539,8 +547,14 @@ fn phrases_split_into_role_colours() {
     const WHITE: i32 = 0x00FF_FFFF;
     let pack = fixture_pack("en");
     // (name, phrase, grammar colours on, spans)
+    type Row = (
+        &'static str,
+        &'static str,
+        bool,
+        &'static [(&'static str, i32)],
+    );
     #[rustfmt::skip]
-    let rows: [(&str, &str, bool, &[(&str, i32)]); 4] = [
+    let rows: [Row; 4] = [
         ("parts in their colours, the full stop as a particle", "break.bloop", true,
             &[("Ich ", PRON), ("zerbreche ", VERB), ("den ", PART), ("Bloop", OBJ), (".", PART)]),
         ("no space after an elided word, other roles in the fallback", "use.zing", true,

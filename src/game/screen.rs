@@ -16,24 +16,40 @@ use mod_api::{
 };
 use std::sync::atomic::Ordering;
 
+/// The option buttons' width in a wide enough window; a narrower one shrinks them to fit.
 const BUTTON_W: f32 = 190.0;
 const BUTTON_H: f32 = 22.0;
 const ROW_H: f32 = 44.0;
+/// Between the two columns.
+const GAP: f32 = 12.0;
+/// Inside the card's edges.
+const PAD: f32 = 16.0;
+/// Kept between the card and the screen's edges.
+const EDGE: f32 = 4.0;
 const PROMPT: u32 = 0xFFFF_E08A;
 const GREY: u32 = 0xFFBB_BBBB;
 const HURRY: u32 = 0xFFFF_7A7A;
 /// What the option text is brightened by (`NarratorHud.lift`, 0.35).
 const LIFT: f32 = 0.35;
 
-/// Where the screen's parts are, for a screen of this size.
+/// Where the screen's parts are, for a screen of this size. The card and its two columns of
+/// options keep inside the screen's width: a narrow window gets narrower buttons.
 struct Layout {
     w: f32,
     h: f32,
+    button_w: f32,
 }
 
 impl Layout {
     fn new([w, h]: [f32; 2]) -> Self {
-        Self { w, h }
+        let room = (w - EDGE * 2.0 - PAD * 2.0 - GAP) / 2.0;
+        let button_w = room.floor().clamp(1.0, BUTTON_W);
+        Self { w, h, button_w }
+    }
+
+    /// The card's width: the two columns and their padding.
+    fn card_w(&self) -> f32 {
+        self.button_w * 2.0 + GAP + PAD * 2.0
     }
 
     /// `buttonX`, `buttonY`: two columns of two.
@@ -41,9 +57,9 @@ impl Layout {
         let column = (index % 2) as f32;
         let row = (index / 2) as f32;
         [
-            (self.w / 2.0).floor() - BUTTON_W - 6.0 + column * (BUTTON_W + 12.0),
+            (self.w / 2.0).floor() - self.button_w - GAP / 2.0 + column * (self.button_w + GAP),
             (self.h / 2.0).floor() + 2.0 + row * ROW_H,
-            BUTTON_W,
+            self.button_w,
             BUTTON_H,
         ]
     }
@@ -87,9 +103,22 @@ fn label(teacher: &Teacher, index: usize, option: &Phrase) -> Text {
     text
 }
 
-/// A line of text `scale` times its size, centred on `at`, in one batch.
-fn centred_text(draw: &mut dyn DrawContext, text: &str, [x, y]: [f32; 2], scale: f32, colour: u32) {
-    let offset = -(width(draw, text) / 2.0).floor();
+/// A line of text `scale` times its size, centred on `at`, in one batch; scaled down further
+/// when it would be wider than `room`.
+fn centred_text(
+    draw: &mut dyn DrawContext,
+    text: &str,
+    [x, y]: [f32; 2],
+    [scale, room]: [f32; 2],
+    colour: u32,
+) {
+    let text_w = width(draw, text);
+    let scale = if text_w * scale > room && text_w > 0.0 {
+        room / text_w
+    } else {
+        scale
+    };
+    let offset = -(text_w / 2.0).floor();
     let ops = [
         GuiDraw::Push(vec![PoseOp::Translate(x, y), PoseOp::Scale(scale, scale)]),
         GuiDraw::Text {
@@ -102,7 +131,7 @@ fn centred_text(draw: &mut dyn DrawContext, text: &str, [x, y]: [f32; 2], scale:
         GuiDraw::Pop,
     ];
     if let Err(e) = draw.gui_paint(&ops) {
-        eprintln!("[{}] could not draw the question: {e:?}", super::MOD_ID);
+        super::log_warn(format!("could not draw the question: {e:?}"));
     }
 }
 
@@ -146,7 +175,8 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
     let [w, h] = size;
     let (cx, mid) = (w / 2.0, (h / 2.0).floor());
     draw.fill_gradient([0.0, 0.0, w, h], 0xC010_1010, 0xD010_1010);
-    let card_w = BUTTON_W * 2.0 + 12.0 + 32.0;
+    let card_w = layout.card_w();
+    let room = card_w - PAD * 2.0;
     let x0 = (cx - card_w / 2.0).round();
     let bottom = layout.option(3)[1] + BUTTON_H + 10.0;
     panel(draw, [x0, mid - 130.0, x0 + card_w, bottom], 255);
@@ -171,21 +201,27 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
         "learnordie.quiz.prompt"
     };
     let title = io.tr(host, &Text::translate(title, vec![]));
-    centred_text(draw, &title, [cx, mid - 62.0], 1.0, GREY);
+    centred_text(draw, &title, [cx, mid - 62.0], [1.0, room], GREY);
     if open.listening {
         let replay = layout.replay();
         let text = Text::translate("learnordie.quiz.replay", vec![]);
         let _ = draw.widget_button(replay, &text, true, inside(mouse, replay));
     } else {
-        centred_text(draw, &open.question.en, [cx, mid - 48.0], 1.6, PROMPT);
+        centred_text(
+            draw,
+            &open.question.en,
+            [cx, mid - 48.0],
+            [1.6, room],
+            PROMPT,
+        );
     }
 
     let left = open.left_ms(now);
     let timer = format!("{:.0} s", left as f64 / 1000.0);
-    let bar_right = x0 + card_w - 16.0 - width(draw, &timer) - 6.0;
+    let bar_right = x0 + card_w - PAD - width(draw, &timer) - 6.0;
     time_bar(
         draw,
-        [x0 + 16.0, mid - 20.0, bar_right - (x0 + 16.0)],
+        [x0 + PAD, mid - 20.0, bar_right - (x0 + PAD)],
         open.fraction_left(now),
     );
     let colour = if left < 3000 { HURRY } else { GREY };

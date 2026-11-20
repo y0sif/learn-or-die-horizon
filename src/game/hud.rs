@@ -1,11 +1,11 @@
 //! The teacher's HUD layer (Java `NarratorHud`, the pilot's parts): her portrait in a corner with
-//! the lipsync mouth, the held item's noun over the hotbar, the key notices, and the phrase she
-//! says in words coloured by their grammatical role with its translation under it.
+//! the lipsync mouth, the held item's noun over the hotbar, and the phrase she says in words
+//! coloured by their grammatical role with its translation under it.
 //!
 //! Scaled text goes through one `gui_paint` batch per block, as the SDK's pose (`GuiDraw::Push`)
 //! holds only inside one batch. The portrait is drawn with `DrawContext::sprite`, which takes the
 //! pack's `textures/gui/teacher.png` as the GUI atlas sprite `zhnarrator_de:gui/teacher`.
-use super::{Game, STATE, State, lock};
+use super::{STATE, State, lock};
 use crate::core::Teacher;
 use mod_api::client::hud_layout::PoseOp;
 use mod_api::{
@@ -20,7 +20,6 @@ pub(crate) const PANEL: u32 = 0x0014_161A;
 pub(crate) const GOLD: u32 = 0x00E6_B422;
 /// The held label's text colour.
 const LABEL: u32 = 0x00FF_E08A;
-const NOTICE_MS: i64 = 2000;
 
 pub(crate) fn register(event: &mut RegisterGuiLayersEvent<'_>) {
     event.layers.push(GuiLayer {
@@ -81,7 +80,6 @@ pub(crate) fn draw(_host: &dyn ClientHost, event: &mut GuiLayerDrawEvent<'_>) {
     let [w, h] = draw.size();
     portrait(draw, teacher, now, [w, h]);
     held_label(draw, teacher, now, [w, h]);
-    notice(draw, game, now, [w, h]);
     spoken(draw, teacher, now, [w, h]);
 }
 
@@ -136,29 +134,6 @@ fn held_label(draw: &mut dyn DrawContext, teacher: &Teacher, now: i64, [w, h]: [
         &phrase.text,
         [x0 + 7.0, y0 + 3.0],
         with_alpha(LABEL, alpha),
-        true,
-    );
-}
-
-/// A key's notice, where the original shows it on the action bar: two seconds, fading at the end.
-fn notice(draw: &mut dyn DrawContext, game: &Game, now: i64, [w, h]: [f32; 2]) {
-    let Some((text, at)) = &game.notice else {
-        return;
-    };
-    let age = now - at;
-    if !(0..=NOTICE_MS).contains(&age) {
-        return;
-    }
-    let alpha = if age > NOTICE_MS - 500 {
-        (255 * (NOTICE_MS - age) / 500).max(20) as i32
-    } else {
-        255
-    };
-    let tw = width(draw, text);
-    draw.text(
-        text,
-        [(w - tw) / 2.0, h - 92.0],
-        with_alpha(0x00FF_FFFF, alpha),
         true,
     );
 }
@@ -231,6 +206,6 @@ fn spoken(draw: &mut dyn DrawContext, teacher: &Teacher, now: i64, [w, h]: [f32;
         ops.push(GuiDraw::Pop);
     }
     if let Err(e) = draw.gui_paint(&ops) {
-        eprintln!("[{}] could not draw the phrase: {e:?}", super::MOD_ID);
+        super::log_warn(format!("could not draw the phrase: {e:?}"));
     }
 }

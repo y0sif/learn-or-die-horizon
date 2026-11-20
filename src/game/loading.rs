@@ -4,7 +4,6 @@
 //! A reload listener can only read the files of its own directory, and the pack's files sit at
 //! the namespace root, so the listener only counts reloads; the next client tick reads the files
 //! with the host and builds the teacher.
-use super::MOD_ID;
 use super::client::Client;
 use super::files;
 use crate::core::{Pack, Teacher};
@@ -42,7 +41,9 @@ pub(crate) fn add_listener(listeners: &mut dyn ClientReloadListeners) {
         return;
     };
     if let Err(e) = listeners.add_listener(id, converter, Arc::new(ReloadCounter)) {
-        eprintln!("[{MOD_ID}] could not register the pack reload listener: {e:?}");
+        super::log_warn(format!(
+            "could not register the pack reload listener: {e:?}"
+        ));
     }
 }
 
@@ -91,10 +92,10 @@ pub(crate) fn load(
     let mut pack = Pack::parse(NAMESPACE, &phrases, lipsync.as_deref(), &hints)?;
     let events = io.sound_events(host);
     let (resolved, total) = pack.check_sounds(|event| events.contains(event));
-    eprintln!(
-        "[{MOD_ID}] {NAMESPACE}: {} phrases loaded, {resolved} of {total} sound events resolved",
+    super::log_info(format!(
+        "{NAMESPACE}: {} phrases loaded, {resolved} of {total} sound events resolved",
         pack.phrases().len()
-    );
+    ));
     let progress = match previous {
         Some(teacher) => std::mem::take(&mut teacher.progress),
         None => files::load_progress(host, io, &pack.meta.language),

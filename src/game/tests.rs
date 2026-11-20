@@ -3,13 +3,13 @@
 //! reads and writes the fake host cannot; the pack is invented for the test.
 use super::client::{Click, Client, Store, View};
 use super::hud::LAYER;
-use super::{files, keys, quiz_pauses, set_io, take_escape_pause, with_state};
+use super::{files, keys, quiz_pauses, set_io, take_escape_pause, take_log_lines, with_state};
 use mod_api::serde_json::{self, Value};
 use mod_api::testing::{FakeHost, with_mods};
 use mod_api::text::TextContent;
 use mod_api::{
-    BlockClick, ClientHost, DrawContext, GuiDraw, ItemKey, ModEntry, ScreenView, SoundPlay,
-    SoundRef, SoundSource, Text, TextFormError,
+    BlockClick, ClientHost, DrawContext, GuiDraw, Hand, InteractionAttempt, InteractionKey,
+    ItemKey, ModEntry, ScreenView, SoundPlay, SoundRef, SoundSource, Text, TextFormError,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -20,7 +20,8 @@ const PHRASES: &str = r#"{
   "speeds": ["normal"],
   "words": [
     {"key": "bloop", "kind": "block", "patterns": ["bloop"]},
-    {"key": "quux", "kind": "item", "patterns": ["quux"]}
+    {"key": "quux", "kind": "item", "patterns": ["quux"]},
+    {"key": "zap", "kind": "block", "patterns": ["zap"]}
   ],
   "phrases": [
     {"id": "break.bloop", "action": "break", "key": "bloop", "text": "Ich zerbreche den Bloop.", "en": "I break the bloop.",
@@ -29,22 +30,25 @@ const PHRASES: &str = r#"{
     {"id": "pickup.bloop", "action": "pickup", "key": "bloop", "text": "Ich nehme den Bloop.", "en": "I take the bloop."},
     {"id": "hold.bloop", "action": "hold", "key": "bloop", "text": "der Bloop", "en": "bloop"},
     {"id": "hold.quux", "action": "hold", "key": "quux", "text": "das Quux", "en": "quux"},
-    {"id": "pickup.quux", "action": "pickup", "key": "quux", "text": "Ich nehme das Quux.", "en": "I take the quux."}
+    {"id": "pickup.quux", "action": "pickup", "key": "quux", "text": "Ich nehme das Quux.", "en": "I take the quux."},
+    {"id": "break.zap", "action": "break", "key": "zap", "text": "Ich zerbreche den Zap.", "en": "I break the zap."}
   ]
 }"#;
 
 const LIPSYNC: &str = r#"{"window": 40, "clips": {"v1.normal.hold.quux": "1221"}}"#;
 
-const IDS: [&str; 6] = [
+const IDS: [&str; 7] = [
     "break.bloop",
     "place.bloop",
     "pickup.bloop",
     "hold.bloop",
     "hold.quux",
     "pickup.quux",
+    "break.zap",
 ];
 const START: i64 = 1_700_000_000_000;
 const BLOCK: [i32; 3] = [4, 64, 4];
+const ZAP: [i32; 3] = [5, 64, 4];
 
 /// What the scripted client holds and what the mod did to it.
 #[derive(Default)]
@@ -52,6 +56,8 @@ struct Session {
     now: i64,
     view: Option<View>,
     blocks: HashMap<[i32; 3], String>,
+    /// The block under the crosshair.
+    aim: Option<[i32; 3]>,
     clicks: Vec<&'static str>,
     screen: bool,
     opened: usize,
@@ -74,13 +80,18 @@ impl TestClient {
         }
     }
 
-    /// The voice played this phrase.
-    fn said(&self, id: &str) -> bool {
+    /// How often the voice played this phrase.
+    fn plays(&self, id: &str) -> usize {
         let event = format!("zhnarrator_de:v1.normal.{id}");
         self.session()
             .played
             .iter()
-            .any(|sound| sound.identifier == event && sound.source == SoundSource::Voice)
+            .filter(|sound| sound.identifier == event && sound.source == SoundSource::Voice)
+            .count()
+    }
+
+    fn said(&self, id: &str) -> bool {
+        self.plays(id) > 0
     }
 
     fn file(&self, store: Store, name: &str) -> Option<Value> {
@@ -124,6 +135,11 @@ impl Client for TestClient {
             .get(&pos)
             .map_or("minecraft:air", String::as_str);
         Some(block.to_string())
+    }
+    fn attack_target(&self, _: &dyn ClientHost) -> Option<([i32; 3], String)> {
+        let session = self.session();
+        let held = session.view.as_ref()?.held_item.clone();
+        Some((session.aim?, held))
     }
     fn click(&self, _: &dyn ClientHost, _: &BlockClick<'_>) -> Option<Click> {
         None
@@ -253,6 +269,19 @@ fn tick(host: &mut FakeHost, io: &TestClient, ms: i64) {
     mod_api::dispatch_client_tick_post(host);
 }
 
+/// The attack key acts on the crosshair's target, a click.
+fn attack(host: &mut FakeHost) {
+    let (mut swing, mut cancelled) = (true, false);
+    mod_api::dispatch_interaction_key_mapping_triggered(
+        host,
+        InteractionKey::Attack,
+        Hand::Main,
+        InteractionAttempt::Press,
+        &mut swing,
+        &mut cancelled,
+    );
+}
+
 fn press(host: &FakeHost, screen: &ScreenView<'_>, key: &str) -> bool {
     let mut cancelled = false;
     mod_api::dispatch_screen_key_pressed_pre(host, screen, key, false, 0, &mut cancelled);
@@ -278,10 +307,15 @@ fn hooks_drive_the_teacher() {
         }
         .into();
 
-        // The title screen: the pack loads, the default config is written.
+        // The title screen: the pack loads and says so in the game's log (the mixin adds the
+        // `[learnordie]` target), the default config is written.
         tick(&mut host, &io, 50);
         let phrases = with_state(|teacher, _| teacher.map(|t| t.pack.phrases().len()));
         assert_eq!(phrases, Some(IDS.len()));
+        let n = IDS.len();
+        let line = format!("zhnarrator_de: {n} phrases loaded, {n} of {n} sound events resolved");
+        let lines = take_log_lines();
+        assert!(lines.contains(&(false, line)), "{lines:?}");
         let config = io
             .file(Store::Config, files::CONFIG_FILE)
             .expect("config written");
@@ -322,6 +356,21 @@ fn hooks_drive_the_teacher() {
                 .iter()
                 .any(|s| s == "zhnarrator_de:gui/teacher")
         );
+
+        // A block that breaks at once (creative, grass, torches): the attack key acts on it and
+        // it is gone by the tick's end, though it was never mined. Said once.
+        io.session().blocks.insert(ZAP, "minecraft:zap".into());
+        io.session().aim = Some(ZAP);
+        io.update(|view| view.attack_down = true);
+        attack(&mut host);
+        io.session().blocks.insert(ZAP, "minecraft:air".into());
+        tick(&mut host, &io, 100);
+        io.session().aim = None;
+        io.update(|view| view.attack_down = false);
+        for _ in 0..10 {
+            tick(&mut host, &io, 100);
+        }
+        assert_eq!(io.plays("break.zap"), 1);
 
         // Breaking a block: mined for a while, then gone.
         for _ in 0..20 {
@@ -407,12 +456,17 @@ fn hooks_drive_the_teacher() {
         let correct = with_state(|teacher, _| teacher.map(|t| t.progress.correct(&id)));
         assert_eq!(correct, Some(1));
 
-        // The toggle key turns her off, and the config file keeps it.
+        // The toggle key turns her off, says so in chat, and the config file keeps it.
         io.session().clicks.push(keys::TOGGLE);
         tick(&mut host, &io, 50);
         let config = io
             .file(Store::Config, files::CONFIG_FILE)
             .expect("config written");
         assert_eq!(config["enabled"], Value::Bool(false));
+        let chat = io.session().chat.clone();
+        assert!(
+            chat.iter().any(|line| line == "learnordie.notice.off"),
+            "{chat:?}"
+        );
     });
 }

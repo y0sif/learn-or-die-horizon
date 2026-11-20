@@ -32,8 +32,9 @@ pub struct WorldTick<'a> {
     /// The main-hand item id (`minecraft:air` or empty when the hand is empty) and its count.
     pub held_item: &'a str,
     pub held_count: i32,
-    /// Every inventory slot as `(item id, count)`; empty slots may be left out.
-    pub inventory: &'a [(&'a str, i32)],
+    /// Every inventory slot as `(item id, count)`; empty slots may be left out. `None` when the
+    /// game could not read it this tick: the pickup check waits for the next.
+    pub inventory: Option<&'a [(&'a str, i32)]>,
     /// Any screen is open.
     pub screen_open: bool,
     /// The open screen is the question screen.

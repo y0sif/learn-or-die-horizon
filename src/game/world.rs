@@ -2,7 +2,7 @@
 //! overworld seed in single player, the server address elsewhere. The seed is server-only, so the
 //! integrated server's half reads it when it starts; both halves run in the one process.
 use super::client::View;
-use super::{MOD_ID, lock};
+use super::lock;
 use crate::core::{server_world_key, singleplayer_world_key};
 use mod_api::ServerHost;
 use std::sync::Mutex;
@@ -37,8 +37,8 @@ pub(crate) fn key(view: &View, now: i64, waiting_since: i64) -> Option<String> {
     match *lock(&SEED) {
         Some(seed) => Some(singleplayer_world_key(folder, seed)),
         None if now - waiting_since >= SEED_WAIT_MS => {
-            eprintln!(
-                "[{MOD_ID}] no seed from the integrated server; filing progress under seed 0"
+            super::log_warn(
+                "no seed from the integrated server; filing progress under seed 0".into(),
             );
             Some(singleplayer_world_key(folder, 0))
         }
