@@ -6,7 +6,7 @@
 //! with the host and builds the teacher.
 use super::client::Client;
 use super::files;
-use crate::core::{Pack, Teacher};
+use crate::core::{Pack, Pictures, Teacher};
 use mod_api::{
     ClientHost, ClientReloadContext, ClientReloadListener, ClientReloadListeners,
     FileToIdConverter, Identifier, ReloadApply, ReloadResourceError, Text,
@@ -73,13 +73,13 @@ fn text(host: &dyn ClientHost, io: &dyn Client, name: &str) -> Result<Option<Str
 
 /// The teacher for the pack in the resources now. A teacher already running hands over its config
 /// and progress (it keeps them when the pack fails to load); otherwise both are read from their
-/// files. Returns the item ids in registry order too, for the question's picture.
+/// files. Returns the item registry indexed for the question's picture too.
 pub(crate) fn load(
     host: &dyn ClientHost,
     io: &dyn Client,
     previous: Option<&mut Teacher>,
     now: i64,
-) -> Result<(Teacher, Vec<String>), String> {
+) -> Result<(Teacher, Pictures), String> {
     let phrases = text(host, io, "phrases.json")?.ok_or_else(|| {
         format!("no {NAMESPACE}:phrases.json in the resources (is the original jar referenced?)")
     })?;
@@ -100,9 +100,7 @@ pub(crate) fn load(
         Some(teacher) => std::mem::take(&mut teacher.progress),
         None => files::load_progress(host, io, &pack.meta.language),
     };
+    let pictures = pack.pictures(io.item_ids(host));
     let seed = (now as u64) ^ 0x9E37_79B9_7F4A_7C15;
-    Ok((
-        Teacher::new(pack, config, progress, seed),
-        io.item_ids(host),
-    ))
+    Ok((Teacher::new(pack, config, progress, seed), pictures))
 }

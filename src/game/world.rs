@@ -10,7 +10,8 @@ use std::sync::Mutex;
 /// How long a single-player join waits for the seed before filing under seed 0.
 const SEED_WAIT_MS: i64 = 5000;
 
-static SEED: Mutex<Option<i64>> = Mutex::new(None);
+/// The integrated server's overworld seed, while one runs.
+pub(super) static SEED: Mutex<Option<i64>> = Mutex::new(None);
 
 /// The integrated server started: keep its overworld seed for the client half.
 pub(crate) fn server_started(host: &mut dyn ServerHost, dedicated: bool) {

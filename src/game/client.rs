@@ -27,8 +27,9 @@ pub struct View {
     pub dimension: String,
     /// This window owns the integrated server it plays on (open to LAN or not).
     pub singleplayer: bool,
-    /// That integrated server is open to LAN (as the `quiz_pause` mixin last saw it).
-    pub published: bool,
+    /// That integrated server is open to LAN or has split-screen players joined, so it does not
+    /// pause (as the `quiz_pause` mixin last saw it).
+    pub shared: bool,
     /// The save's folder under `saves/`, in single player.
     pub save_folder: Option<String>,
     /// The joined server's address, elsewhere.
@@ -204,7 +205,7 @@ impl Client for HostClient {
                 .dimension(host)
                 .map_or_else(|| host.dimension().to_string(), |d| d.to_string()),
             singleplayer: server.as_ref().is_some_and(|s| s.integrated_local),
-            published: super::published(),
+            shared: super::shared(),
             save_folder: server.as_ref().and_then(|s| s.save_folder.clone()),
             address: server.and_then(|s| s.address),
             paused: host.is_paused(),

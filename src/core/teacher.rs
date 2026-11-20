@@ -158,6 +158,13 @@ impl Teacher {
         self.speaker.take_commands()
     }
 
+    /// The player left the world: her clip stops and what is queued is dropped, so none of it is
+    /// said in the next world. Returns the sound commands to run.
+    pub fn left_world(&mut self, now: i64) -> Vec<SoundCommand> {
+        self.speaker.stop(now);
+        self.speaker.take_commands()
+    }
+
     /// Shows `display` while `clips` play one after the other. `fresh` skips the same-event
     /// cooldown.
     pub fn say_sequence(&mut self, display: &Phrase, clips: &[Phrase], fresh: bool, now: i64) {

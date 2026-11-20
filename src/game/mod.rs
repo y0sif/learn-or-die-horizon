@@ -18,7 +18,7 @@ mod sound;
 mod tests;
 pub(crate) mod world;
 
-use crate::core::{Outcome, QuizEvent, Teacher};
+use crate::core::{Outcome, Pictures, QuizEvent, Teacher};
 use client::{Client, HostClient, View};
 use mod_api::{ClientHost, SoundRef, Text};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,9 +32,10 @@ static QUIZ_PAUSES: AtomicBool = AtomicBool::new(false);
 /// Esc has just suspended the question: the `quiz_escape` mixin opens the pause menu once Escape
 /// has closed the screen, as the original's `onClose` does. Cleared every client tick.
 static ESCAPE_PAUSE: AtomicBool = AtomicBool::new(false);
-/// The integrated server is open to LAN (Java `IntegratedServer.isPublished`), as the
-/// `quiz_pause` mixin sees it every frame: no API tells a mod.
-static PUBLISHED: AtomicBool = AtomicBool::new(false);
+/// The integrated server is open to LAN (Java `IntegratedServer.isPublished`) or has split-screen
+/// players joined, as the `quiz_pause` mixin sees it every frame (no API tells a mod): the world
+/// then runs on behind a pause screen.
+static SHARED: AtomicBool = AtomicBool::new(false);
 
 /// For the `quiz_pause` mixin: the question screen asks the game to pause.
 pub fn quiz_pauses() -> bool {
@@ -47,13 +48,14 @@ pub fn take_escape_pause() -> bool {
     ESCAPE_PAUSE.swap(false, Ordering::Relaxed)
 }
 
-/// For the `quiz_pause` mixin: whether the integrated server is open to LAN.
-pub fn set_published(published: bool) {
-    PUBLISHED.store(published, Ordering::Relaxed);
+/// For the `quiz_pause` mixin: whether the integrated server is open to LAN or has split-screen
+/// players joined.
+pub fn set_shared(shared: bool) {
+    SHARED.store(shared, Ordering::Relaxed);
 }
 
-pub(crate) fn published() -> bool {
-    PUBLISHED.load(Ordering::Relaxed)
+pub(crate) fn shared() -> bool {
+    SHARED.load(Ordering::Relaxed)
 }
 
 /// The game's log (`logs/latest.log`) is written by the game's own `log` crate. A mod's `log`
@@ -94,8 +96,8 @@ pub fn take_log_lines() -> Vec<(bool, String)> {
 pub(crate) struct Game {
     /// The reload the teacher was built after (or failed at).
     loaded: Option<u64>,
-    /// Every item id in registry order, for the question's picture.
-    items: Vec<String>,
+    /// The item registry, indexed for the question's picture.
+    pictures: Pictures,
     /// The level joined, by its view hash; `None` outside a world and while a join waits.
     level: Option<u64>,
     /// When a single-player join began waiting for the seed.
@@ -223,12 +225,12 @@ fn reload(
     }
     game.loaded = Some(generation);
     match loading::load(host, io, teacher.as_mut(), now) {
-        Ok((fresh, items)) => {
+        Ok((fresh, pictures)) => {
             if let Some(sound) = game.sound.take() {
                 io.stop(host, sound);
             }
             *teacher = Some(fresh);
-            game.items = items;
+            game.pictures = pictures;
             game.level = None;
             game.target = None;
             game.attacked.clear();
@@ -239,12 +241,14 @@ fn reload(
     }
 }
 
-/// The player left the world: the progress is saved and the trackers forgotten.
+/// The player left the world: the progress is saved, her voice stopped and the trackers
+/// forgotten.
 fn leave(host: &dyn ClientHost, io: &dyn Client, teacher: &mut Teacher, game: &mut Game, now: i64) {
     game.seed_wait = None;
     if game.level.take().is_none() {
         return;
     }
+    sound::run(host, io, teacher.left_world(now), &mut game.sound);
     let language = &teacher.pack.meta.language;
     files::save_progress(host, io, &mut teacher.progress, language, now);
     game.target = None;
@@ -320,12 +324,11 @@ fn open_question(
     };
     let id = &open.question.id;
     if game.picture.as_ref().is_none_or(|(known, _)| known != id) {
-        let items: Vec<&str> = game.items.iter().map(String::as_str).collect();
         let item = open
             .question
             .key
             .as_deref()
-            .and_then(|key| teacher.pack.picture(key, &items))
+            .and_then(|key| teacher.pack.picture(key, &game.pictures))
             .map(str::to_string);
         game.picture = Some((id.clone(), item));
     }

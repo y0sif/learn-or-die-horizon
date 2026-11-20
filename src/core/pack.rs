@@ -105,6 +105,19 @@ fn glob_matches(glob: &str, path: &str) -> bool {
     rest.ends_with(*last)
 }
 
+/// The item registry indexed for [`Pack::picture`] by [`Pack::pictures`], so opening a question
+/// matches no globs.
+#[derive(Clone, Debug, Default)]
+pub struct Pictures {
+    /// Item ids in registry order.
+    items: Vec<String>,
+    /// Each word key's first item (its registry index) whose path maps to the key, as an item or
+    /// as a block.
+    by_key: HashMap<String, usize>,
+    /// Each registry path's first item (its registry index).
+    by_path: HashMap<String, usize>,
+}
+
 /// The teacher's sprite sheet: frames laid out side by side.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sprite {
@@ -429,26 +442,41 @@ impl Pack {
             .unwrap_or_default()
     }
 
-    /// The item to draw for a word key. `items` is the item registry in registry order. First an
-    /// item or block item whose path maps to the key, then an item named by one of the key's exact
-    /// patterns, then the spawn egg of the entity.
-    pub fn picture<'a>(&self, key: &str, items: &[&'a str]) -> Option<&'a str> {
-        let maps_to_key = |item: &str| {
-            self.key_for("item", item) == Some(key) || self.key_for("block", item) == Some(key)
-        };
-        if let Some(&item) = items.iter().find(|&&item| maps_to_key(item)) {
-            return Some(item);
+    /// Indexes the item registry (`items`, in registry order) for [`Pack::picture`]. This is the
+    /// one pass that matches every item against the word globs, once per pack and registry.
+    pub fn pictures(&self, items: Vec<String>) -> Pictures {
+        let mut by_key = HashMap::new();
+        let mut by_path = HashMap::new();
+        for (index, item) in items.iter().enumerate() {
+            for kind in ["item", "block"] {
+                if let Some(key) = self.key_for(kind, item) {
+                    by_key.entry(key.to_string()).or_insert(index);
+                }
+            }
+            by_path.entry(path_of(item).to_string()).or_insert(index);
+        }
+        Pictures {
+            items,
+            by_key,
+            by_path,
+        }
+    }
+
+    /// The item to draw for a word key, from the registry `pictures` indexes. First the first
+    /// item in registry order whose path maps to the key as an item or a block, then an item
+    /// named by one of the key's exact patterns, then the spawn egg of the entity.
+    pub fn picture<'a>(&self, key: &str, pictures: &'a Pictures) -> Option<&'a str> {
+        let item = |index: usize| pictures.items.get(index).map(String::as_str);
+        if let Some(&index) = pictures.by_key.get(key) {
+            return item(index);
         }
         for kind in ["item", "block"] {
             for pattern in self.patterns_of(kind, key) {
                 if pattern.contains('*') {
                     continue;
                 }
-                if let Some(&item) = items
-                    .iter()
-                    .find(|&&item| path_of(item) == pattern.as_str())
-                {
-                    return Some(item);
+                if let Some(&index) = pictures.by_path.get(pattern.as_str()) {
+                    return item(index);
                 }
             }
         }
@@ -457,19 +485,16 @@ impl Pack {
         } else {
             key
         };
-        let mut names = vec![entity.to_string()];
-        names.extend(
-            self.patterns_of("entity", key)
-                .iter()
-                .filter(|pattern| !pattern.contains('*'))
-                .cloned(),
-        );
-        items.iter().copied().find(|item| {
-            let path = path_of(item);
-            names
-                .iter()
-                .any(|name| path.strip_suffix("_spawn_egg") == Some(name.as_str()))
-        })
+        let exact = self
+            .patterns_of("entity", key)
+            .iter()
+            .map(String::as_str)
+            .filter(|pattern| !pattern.contains('*'));
+        std::iter::once(entity)
+            .chain(exact)
+            .filter_map(|name| pictures.by_path.get(&format!("{name}_spawn_egg")).copied())
+            .min()
+            .and_then(item)
     }
 
     /// The configured voice when the pack has it, else the pack's first.

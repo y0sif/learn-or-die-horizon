@@ -173,7 +173,7 @@ pub(crate) fn world_tick<'a>(
         inventory,
         screen_open: view.screen_open,
         question_screen_open: view.our_screen,
-        singleplayer: view.singleplayer && !view.published,
+        singleplayer: view.singleplayer && !view.shared,
         dead: view.health <= 0.0,
         health: view.health,
         sleeping: view.sleeping,

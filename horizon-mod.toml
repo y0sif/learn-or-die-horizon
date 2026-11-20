@@ -3,6 +3,11 @@ name = "Learn or Die (Horizon port)"
 version = "0.1.0"
 description = "An unofficial Horizon port of Learn or Die by Laren: a German teacher narrates what you do and quizzes you on it."
 authors = ["Laren (original Learn or Die)", "y0sif (Horizon port)"]
+# Laren's terms, which the port keeps (LICENSE): the Mods screen shows them and credits Laren.
+license = "All Rights Reserved"
+license_url = "https://github.com/Larenlearn/learn-or-die"
+credits = "Learn or Die is made by Laren: learnordie.me and github.com/Larenlearn/learn-or-die. Ported with Laren's permission."
+homepage = "https://learnordie.me"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside data/ and assets/.
 api = "0.2"
 side = "both"
@@ -19,10 +24,11 @@ mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
 
 # A mod screen never pauses single player (Screen::Mod is not a pause screen). The original's QuizScreen
 # does when `quizPauseGame` is on (`isPauseScreen`): this adds "the question screen is up and asks to pause"
-# to Minecraft.pause, still for single player only, not published to LAN. Run every frame, it also tells
-# the mod whether the world is open to LAN (no API does), so the quiz waits there as the original's does,
-# and writes the mod's queued log lines with the game's own `log` crate, so they reach logs/latest.log
-# (a mod's `log` dependency would be a separate copy that the game's logger never hears).
+# to Minecraft.pause, still for single player only: not open to LAN and no split-screen players joined, as
+# Minecraft.pause itself checks. Run every frame, it also tells the mod whether the world is shared that way
+# (no API does), so the quiz waits there as the original's does on LAN, and writes the mod's queued log lines
+# with the game's own `log` crate, so they reach logs/latest.log (a mod's `log` dependency would be a separate
+# copy that the game's logger never hears).
 [[native.mixin]]
 id = "quiz_pause"
 target = "horizon_client::game::pointer_capture::Game<'_>::pauses_game"

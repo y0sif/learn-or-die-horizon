@@ -21,7 +21,7 @@ mod tests;
 
 pub use config::Config;
 pub use hud::{HudText, Span, spans};
-pub use pack::{Lipsync, Meta, Pack, Part, Phrase, Sprite, Word};
+pub use pack::{Lipsync, Meta, Pack, Part, Phrase, Pictures, Sprite, Word};
 pub use progress::{Progress, REST_FOREVER_MS, World, server_world_key, singleplayer_world_key};
 pub use quiz::{OpenQuestion, QuizEvent};
 pub use speaker::SoundCommand;

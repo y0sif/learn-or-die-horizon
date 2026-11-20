@@ -3,13 +3,16 @@
 //! reads and writes the fake host cannot; the pack is invented for the test.
 use super::client::{Click, Client, Store, View};
 use super::hud::LAYER;
-use super::{files, keys, quiz_pauses, set_io, take_escape_pause, take_log_lines, with_state};
+use super::{
+    files, keys, lock, quiz_pauses, set_io, take_escape_pause, take_log_lines, with_state, world,
+};
 use mod_api::serde_json::{self, Value};
 use mod_api::testing::{FakeHost, with_mods};
 use mod_api::text::TextContent;
 use mod_api::{
-    BlockClick, ClientHost, DrawContext, GuiDraw, Hand, InteractionAttempt, InteractionKey,
-    ItemKey, ModEntry, ScreenView, SoundPlay, SoundRef, SoundSource, Text, TextFormError,
+    BlockClick, BlockHit, ClientHost, DrawContext, GuiDraw, Hand, HostSide, InteractionAttempt,
+    InteractionKey, InteractionResult, ItemKey, LevelDimension, LogicalSide, ModEntry, ScreenView,
+    SoundPlay, SoundRef, SoundSource, Text, TextFormError, TriState,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -21,7 +24,8 @@ const PHRASES: &str = r#"{
   "words": [
     {"key": "bloop", "kind": "block", "patterns": ["bloop"]},
     {"key": "quux", "kind": "item", "patterns": ["quux"]},
-    {"key": "zap", "kind": "block", "patterns": ["zap"]}
+    {"key": "zap", "kind": "block", "patterns": ["zap"]},
+    {"key": "zing", "kind": "block", "patterns": ["zing"]}
   ],
   "phrases": [
     {"id": "break.bloop", "action": "break", "key": "bloop", "text": "Ich zerbreche den Bloop.", "en": "I break the bloop.",
@@ -31,13 +35,14 @@ const PHRASES: &str = r#"{
     {"id": "hold.bloop", "action": "hold", "key": "bloop", "text": "der Bloop", "en": "bloop"},
     {"id": "hold.quux", "action": "hold", "key": "quux", "text": "das Quux", "en": "quux"},
     {"id": "pickup.quux", "action": "pickup", "key": "quux", "text": "Ich nehme das Quux.", "en": "I take the quux."},
-    {"id": "break.zap", "action": "break", "key": "zap", "text": "Ich zerbreche den Zap.", "en": "I break the zap."}
+    {"id": "break.zap", "action": "break", "key": "zap", "text": "Ich zerbreche den Zap.", "en": "I break the zap."},
+    {"id": "use.zing", "action": "use", "key": "zing", "text": "Ich benutze das Zing.", "en": "I use the zing."}
   ]
 }"#;
 
 const LIPSYNC: &str = r#"{"window": 40, "clips": {"v1.normal.hold.quux": "1221"}}"#;
 
-const IDS: [&str; 7] = [
+const IDS: [&str; 8] = [
     "break.bloop",
     "place.bloop",
     "pickup.bloop",
@@ -45,10 +50,14 @@ const IDS: [&str; 7] = [
     "hold.quux",
     "pickup.quux",
     "break.zap",
+    "use.zing",
 ];
 const START: i64 = 1_700_000_000_000;
 const BLOCK: [i32; 3] = [4, 64, 4];
 const ZAP: [i32; 3] = [5, 64, 4];
+const ABOVE: [i32; 3] = [4, 65, 4];
+/// A progress file from an earlier session.
+const KEPT: &[u8] = br#"{"worlds": {"server:earlier": {}}}"#;
 
 /// What the scripted client holds and what the mod did to it.
 #[derive(Default)]
@@ -64,6 +73,10 @@ struct Session {
     played: Vec<SoundPlay>,
     chat: Vec<String>,
     files: HashMap<(Store, String), Vec<u8>>,
+    /// Files that are there but fail to read.
+    unreadable: HashSet<(Store, String)>,
+    /// What the next right click on a block reads as.
+    click: Option<Click>,
 }
 
 #[derive(Default)]
@@ -142,7 +155,7 @@ impl Client for TestClient {
         Some((session.aim?, held))
     }
     fn click(&self, _: &dyn ClientHost, _: &BlockClick<'_>) -> Option<Click> {
-        None
+        self.session().click.clone()
     }
     fn our_screen(&self, _: &dyn ClientHost) -> bool {
         self.session().screen
@@ -197,11 +210,12 @@ impl Client for TestClient {
         store: Store,
         name: &str,
     ) -> Result<Option<Vec<u8>>, String> {
-        Ok(self
-            .session()
-            .files
-            .get(&(store, name.to_string()))
-            .cloned())
+        let session = self.session();
+        let file = (store, name.to_string());
+        if session.unreadable.contains(&file) {
+            return Err("unreadable".into());
+        }
+        Ok(session.files.get(&file).cloned())
     }
     fn write(
         &self,
@@ -222,7 +236,8 @@ impl Client for TestClient {
 struct Canvas {
     texts: Vec<String>,
     sprites: Vec<String>,
-    buttons: Vec<String>,
+    /// Each button's label and rectangle.
+    buttons: Vec<(String, [f32; 4])>,
 }
 
 impl DrawContext for Canvas {
@@ -254,12 +269,12 @@ impl DrawContext for Canvas {
     }
     fn widget_button(
         &mut self,
-        _: [f32; 4],
+        rect: [f32; 4],
         label: &Text,
         _: bool,
         _: bool,
     ) -> Result<(), TextFormError> {
-        self.buttons.push(plain(label));
+        self.buttons.push((plain(label), rect));
         Ok(())
     }
 }
@@ -282,6 +297,71 @@ fn attack(host: &mut FakeHost) {
     );
 }
 
+/// A right click on a block, which the seam reads as `click`.
+fn right_click(host: &mut FakeHost, io: &TestClient, click: Click) {
+    let event: BlockClick<'static> = mod_api::__private::built::BlockClick {
+        side: LogicalSide::Client,
+        dimension: LevelDimension::Overworld,
+        pos: click.pos,
+        hit: BlockHit::new([0.5, 1.0, 0.5], [0, 1, 0], false),
+        hand: Hand::Main,
+        stack: None,
+        player: 0,
+        player_entity_id: 0,
+    }
+    .into();
+    io.session().click = Some(click);
+    let (mut block, mut item) = (TriState::Default, TriState::Default);
+    let (mut result, mut cancelled) = (InteractionResult::Pass, false);
+    let side = HostSide::Client(host);
+    mod_api::dispatch_right_click_block(
+        side,
+        &event,
+        &mut block,
+        &mut item,
+        &mut result,
+        &mut cancelled,
+    );
+}
+
+/// The question screen with the mouse at `mouse`.
+fn screen_at(mouse: [f32; 2]) -> ScreenView<'static> {
+    mod_api::__private::built::ScreenView {
+        id: "mod",
+        menu: None,
+        title: None,
+        rect: [0.0, 0.0, 480.0, 270.0],
+        slots: 0,
+        mouse,
+        partial_tick: 0.0,
+    }
+    .into()
+}
+
+/// Plays on, moving, until the next question opens.
+fn next_question(host: &mut FakeHost, io: &TestClient) {
+    let opened = io.session().opened;
+    for step in 0..200 {
+        io.update(|view| view.yaw = step as f32);
+        tick(host, io, 500);
+        if io.session().opened > opened {
+            return;
+        }
+    }
+    panic!("no question within 100 s");
+}
+
+/// The open question's id and its right option.
+fn right_option() -> (String, usize) {
+    with_state(|teacher, _| {
+        let open = teacher
+            .and_then(|t| t.question().cloned())
+            .expect("a question");
+        let right = open.options.iter().position(|o| o.id == open.question.id);
+        (open.question.id, right.expect("the answer is an option"))
+    })
+}
+
 fn press(host: &FakeHost, screen: &ScreenView<'_>, key: &str) -> bool {
     let mut cancelled = false;
     mod_api::dispatch_screen_key_pressed_pre(host, screen, key, false, 0, &mut cancelled);
@@ -292,20 +372,17 @@ fn press(host: &FakeHost, screen: &ScreenView<'_>, key: &str) -> bool {
 fn hooks_drive_the_teacher() {
     let io = Arc::new(TestClient::default());
     io.session().now = START;
+    // The progress of an earlier session, in a file that cannot be read now.
+    let progress_file = (Store::Data, files::progress_file("de"));
+    io.session()
+        .files
+        .insert(progress_file.clone(), KEPT.into());
+    io.session().unreadable.insert(progress_file.clone());
     set_io(io.clone());
     let mods = vec![ModEntry::new("learnordie", crate::hooks())];
     with_mods(mods.into(), || {
         let mut host = FakeHost::new();
-        let screen: ScreenView<'static> = mod_api::__private::built::ScreenView {
-            id: "mod",
-            menu: None,
-            title: None,
-            rect: [0.0, 0.0, 480.0, 270.0],
-            slots: 0,
-            mouse: [0.0, 0.0],
-            partial_tick: 0.0,
-        }
-        .into();
+        let screen = screen_at([0.0, 0.0]);
 
         // The title screen: the pack loads and says so in the game's log (the mixin adds the
         // `[learnordie]` target), the default config is written.
@@ -339,8 +416,10 @@ fn hooks_drive_the_teacher() {
         }
         assert!(!io.said("hold.bloop"));
         assert!(io.said("hold.quux"));
-        let progress = io.file(Store::Data, &files::progress_file("de"));
-        assert!(progress.is_some_and(|p| p["worlds"].get("server:test.server").is_some()));
+        // The join's save leaves the unreadable progress file as it was.
+        let kept = io.session().files.get(&progress_file).cloned();
+        assert_eq!(kept.as_deref(), Some(KEPT));
+        io.session().unreadable.clear();
 
         // The HUD: the noun, the held label and the portrait.
         let mut canvas = Canvas::default();
@@ -392,15 +471,38 @@ fn hooks_drive_the_teacher() {
         tick(&mut host, &io, 100);
         assert!(io.said("break.bloop"));
 
-        // A question a full interval after she first spoke: the ding, the screen, the pause.
-        for step in 0..200 {
-            io.update(|view| view.yaw = step as f32);
-            tick(&mut host, &io, 500);
-            if io.session().opened > 0 {
-                break;
-            }
+        // Placing: a click the pack has a use phrase for places nothing, a block that has not
+        // shown up within 500 ms is given up, and one that shows up in front of the face is said.
+        let place = |target: &str| Click {
+            main_hand: true,
+            target: target.into(),
+            places: Some("minecraft:bloop".into()),
+            pos: BLOCK,
+            in_front: ABOVE,
+            ..Click::default()
+        };
+        right_click(&mut host, &io, place("minecraft:zing"));
+        io.session().blocks.insert(ABOVE, "minecraft:bloop".into());
+        tick(&mut host, &io, 100);
+        io.session().blocks.remove(&ABOVE);
+        right_click(&mut host, &io, place("minecraft:stone"));
+        tick(&mut host, &io, 600);
+        io.session().blocks.insert(ABOVE, "minecraft:bloop".into());
+        for _ in 0..20 {
+            tick(&mut host, &io, 100);
         }
-        assert_eq!(io.session().opened, 1, "no question within 100 s");
+        assert!(!io.said("place.bloop"));
+        io.session().blocks.remove(&ABOVE);
+        right_click(&mut host, &io, place("minecraft:stone"));
+        io.session().blocks.insert(ABOVE, "minecraft:bloop".into());
+        for _ in 0..3 {
+            tick(&mut host, &io, 100);
+        }
+        assert!(io.said("place.bloop"));
+
+        // A question a full interval after she first spoke: the ding, the screen, the pause.
+        next_question(&mut host, &io);
+        assert_eq!(io.session().opened, 1);
         let ding = io
             .session()
             .played
@@ -433,16 +535,10 @@ fn hooks_drive_the_teacher() {
         let mut canvas = Canvas::default();
         mod_api::dispatch_screen_render_post(&host, &mut canvas, &screen);
         assert_eq!(canvas.buttons.len(), 4, "{:?}", canvas.buttons);
-        assert!(canvas.buttons[0].starts_with("1. "));
+        assert!(canvas.buttons[0].0.starts_with("1. "));
 
         // The right key after the lockout: the screen closes, the chat and the progress say so.
-        let (id, right) = with_state(|teacher, _| {
-            let open = teacher
-                .and_then(|t| t.question().cloned())
-                .expect("a question");
-            let right = open.options.iter().position(|o| o.id == open.question.id);
-            (open.question.id, right.expect("the answer is an option"))
-        });
+        let (id, right) = right_option();
         assert!(press(
             &host,
             &screen,
@@ -455,6 +551,60 @@ fn hooks_drive_the_teacher() {
         assert!(chat.iter().any(|line| line.starts_with("Ja!")), "{chat:?}");
         let correct = with_state(|teacher, _| teacher.map(|t| t.progress.correct(&id)));
         assert_eq!(correct, Some(1));
+        // The file reads again: the earlier progress was set aside before a save replaced it.
+        let saved = io.session().files.clone();
+        let aside = saved.iter().any(|((store, name), bytes)| {
+            *store == Store::Data && name.starts_with("progress-de.json.invalid-") && bytes == KEPT
+        });
+        assert!(aside, "{:?}", saved.keys());
+        let filed = |key: &str| {
+            let progress = io.file(Store::Data, &files::progress_file("de"));
+            progress.is_some_and(|p| p["worlds"].get(key).is_some())
+        };
+        assert!(filed("server:test.server"));
+
+        // A click on the right option answers the next question.
+        io.update(|view| view.paused = false);
+        next_question(&mut host, &io);
+        io.update(|view| view.paused = true);
+        tick(&mut host, &io, 800);
+        let mut canvas = Canvas::default();
+        mod_api::dispatch_screen_render_post(&host, &mut canvas, &screen);
+        let [x, y, w, h] = canvas.buttons[right_option().1].1;
+        let mut cancelled = false;
+        let at = screen_at([x + w / 2.0, y + h / 2.0]);
+        mod_api::dispatch_screen_mouse_button_pressed_pre(&host, &at, 0, 0, &mut cancelled);
+        assert!(cancelled);
+        tick(&mut host, &io, 50);
+        assert!(!io.session().screen);
+        let chat = io.session().chat.clone();
+        let right = chat.iter().filter(|line| line.starts_with("Ja!")).count();
+        assert_eq!(right, 2, "{chat:?}");
+
+        // Single player: the progress is filed under the save folder and the integrated server's
+        // seed; with no seed within 5 s, under seed 0.
+        let solo = |level| View {
+            level,
+            singleplayer: true,
+            save_folder: Some("Testwelt".into()),
+            health: 20.0,
+            on_ground: true,
+            ..View::default()
+        };
+        io.session().view = None;
+        tick(&mut host, &io, 50);
+        *lock(&world::SEED) = Some(0x4d2);
+        io.session().view = Some(solo(2));
+        tick(&mut host, &io, 50);
+        assert!(filed("save:Testwelt:4d2"));
+        io.session().view = None;
+        tick(&mut host, &io, 50);
+        mod_api::dispatch_server_stopped(&mut host, false);
+        io.session().view = Some(solo(3));
+        tick(&mut host, &io, 50);
+        assert!(!filed("save:Testwelt:0"), "a join waits for the seed");
+        tick(&mut host, &io, 5000);
+        assert!(filed("save:Testwelt:0"));
 
         // The toggle key turns her off, says so in chat, and the config file keeps it.
         io.session().clicks.push(keys::TOGGLE);

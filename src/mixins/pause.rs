@@ -6,11 +6,11 @@ fn quiz_pause(value: bool, game: &Game<'_>) -> bool {
             ::log::info!(target: "learnordie", "{text}");
         }
     }
-    let published = game.is_published();
-    mod_learnordie::game::set_published(published);
+    let shared = game.is_published() || game.has_split_players();
+    mod_learnordie::game::set_shared(shared);
     value
         || (mod_learnordie::game::quiz_pauses()
             && game.screen == Screen::Mod
             && game.has_singleplayer_server()
-            && !published)
+            && !shared)
 }

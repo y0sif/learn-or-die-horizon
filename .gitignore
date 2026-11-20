@@ -3,3 +3,4 @@
 # cargo test writes one; the launcher wants a registry-only lock (horizon-launcher native-lock)
 Cargo.lock
 .claude/
+/graphify-out
