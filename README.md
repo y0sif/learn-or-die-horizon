@@ -44,7 +44,9 @@ banner and jingle.
 | Enter | Check a typed answer |
 | Esc | Pause during a question; it comes back when you resume |
 
-These keys can be changed in Controls, Key Binds, except 1 to 4, Enter and Esc.
+These keys can be changed in Controls, Key Binds, except 1 to 4, Enter and Esc. With a separate stopgap mod, a
+controller works on the teacher's screens: A to press, the right stick to scroll, B to go back, the on-screen
+keyboard to type, and the D-pad moves a slider after A grabs it.
 
 ## Install
 

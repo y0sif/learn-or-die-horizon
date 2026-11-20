@@ -5,10 +5,9 @@
 //!
 //! State lives in one process-wide mutex. The native mixins (`src/mixins/`) run inside game
 //! functions with no host, so what they share with the layer is kept in statics of its own: the
-//! pause and shared flags, the queued log lines, the seat reader and what the controller's mixins
-//! read of the screen drawn. Every client read and write
-//! goes through [`client::Client`], one seam the wiring test answers, as the SDK's fake host has no
-//! client backend.
+//! pause and shared flags, the queued log lines, the seat reader and the sliders drawn for the
+//! controller. Every client read and write goes through [`client::Client`], one seam the wiring
+//! test answers, as the SDK's fake host has no client backend.
 //!
 //! Split-screen players each run a `Game` of their own in this process, so they share these
 //! statics and the one teacher. The client hooks act only for this window's own game, seat 0
@@ -128,23 +127,12 @@ pub fn take_log_lines() -> Vec<(bool, String)> {
     std::mem::take(&mut *lock(&LOG_LINES))
 }
 
-/// The screen last drawn has a text field: the typed question or the dictionary. Set by every
-/// draw of this mod's screen; the pad mixins read it, never the state's mutex.
-static PAD_TEXT: AtomicBool = AtomicBool::new(false);
-
 /// A settings slider as a controller's focus takes it: the row's button, the value its handle
 /// shows (0 to 1) and the track a click spans from 0 to 1, `[x, width]`.
 pub type PadSlider = ([f32; 4], f32, [f32; 2]);
 
 /// The sliders the last draw of this mod's screen showed, until the `pad_sliders` mixin takes them.
 static PAD_SLIDERS: Mutex<Vec<PadSlider>> = Mutex::new(Vec::new());
-
-/// For the `pad_typing` mixins: the controller's on-screen keyboard types into this mod's screen,
-/// open (`mod_screen`) and showing a text field. The game's keyboard types nothing into a mod's
-/// screen and closes over one.
-pub fn pad_typing(mod_screen: Option<&str>) -> bool {
-    mod_screen == Some(MOD_ID) && PAD_TEXT.load(Ordering::Relaxed)
-}
 
 /// For the `pad_sliders` mixin: this frame's sliders, to register as the controller's slider
 /// targets (A takes hold, left and right move it), as a mod can only register buttons.
@@ -596,8 +584,8 @@ fn open_question(
 
 /// What the original logs when an answer has no integrated server to act on, once per world
 /// here (the original logs it at every answer).
-pub(crate) const NO_SERVER_LINE: &str =
-    "answers bring no rewards or penalties here: they work in single player only";
+pub(crate) const NO_SERVER_LINE: &str = "answers bring no rewards or penalties here: they work in \
+    single player and for the host of a LAN world";
 
 /// What the answers left to do (Java `QuizManager.answerTyped` and `answer`): the chat lines in
 /// the original's order (what was typed, a learned phrase, the angry teacher, the verdict), the
