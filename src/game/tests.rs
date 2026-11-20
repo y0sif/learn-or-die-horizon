@@ -1109,6 +1109,9 @@ fn hooks_drive_the_teacher() {
         for c in "falsch".chars() {
             assert!(type_char(&host, &screen, c));
         }
+        // A reload meanwhile keeps the question, what was typed and the answer's consequences.
+        with_state(|_, game| game.loaded = None);
+        tick(&mut host, &io, 50);
         assert!(click_at(&host, canvas.button("learnordie.quiz.check")));
         tick(&mut host, &io, 50);
         let sent = io.session().sent.clone();
@@ -1166,6 +1169,32 @@ fn hooks_drive_the_teacher() {
         assert_eq!(second, Some(("das Quäx".to_string(), gold)), "{lines:?}");
         assert_eq!(lines.len(), 3);
 
+        // A resource reload (the Translations row's, F3+T) builds the teacher again, who goes on
+        // where he stood: the exam's countdown is not set back, the item in hand is not said
+        // anew, and a respawn in the same world and dimension after it is no new world.
+        let exam_now = || {
+            let now = io.now();
+            with_state(|teacher, _| teacher.map(|t| t.exam(now)))
+        };
+        let counting = exam_now();
+        let set_back = Some(ExamStage::Playing {
+            left: "20:00".into(),
+        });
+        assert!(counting.is_some() && counting != set_back, "{counting:?}");
+        let held = io.plays("hold.quux");
+        with_state(|_, game| game.loaded = None);
+        tick(&mut host, &io, 0);
+        assert_eq!(exam_now(), counting);
+        for _ in 0..10 {
+            tick(&mut host, &io, 100);
+        }
+        assert_eq!(io.plays("hold.quux"), held);
+        let counting = exam_now();
+        *lock(&world::SEED) = Some(0);
+        io.update(|view| view.level = 4);
+        tick(&mut host, &io, 0);
+        assert_eq!(exam_now(), counting);
+
         // The exam page, from the main page's link, fits the small window. Stop while the exam
         // counts down turns `examAuto` off and says so; Start closes the screen and the questions
         // begin at once, each with its header, the HUD naming the next between them.
@@ -1211,6 +1240,13 @@ fn hooks_drive_the_teacher() {
             tick(&mut host, &io, 800);
             let canvas = drawn(&host, [480.0, 270.0], [0.0, 0.0]);
             assert!(canvas.shows(&format!("learnordie.exam.header[{n}|{total}]")));
+            // A reload while a question shows: the exam goes on, the question still open.
+            if n == total.min(2) {
+                with_state(|_, game| game.loaded = None);
+                tick(&mut host, &io, 50);
+                let canvas = drawn(&host, [480.0, 270.0], [0.0, 0.0]);
+                assert!(canvas.shows(&format!("learnordie.exam.header[{n}|{total}]")));
+            }
             // The first answer is wrong: the result says what was picked.
             let (_, right) = right_option();
             let pick = if n == 1 { (right + 1) % 4 } else { right };

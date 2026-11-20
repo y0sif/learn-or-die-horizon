@@ -205,6 +205,18 @@ impl Speaker {
         self.queue.clear();
     }
 
+    /// The game stopped every sound (a resource reload): the clip playing is over now, as when
+    /// the game reports it stopped, and the rest of its sequence and the queue follow. A joined
+    /// sentence is one sound in the original, so its second clip goes with it.
+    pub(crate) fn cut(&mut self, now: i64) {
+        if self.playing.take().is_some() {
+            self.finished_at = now;
+            if self.joined {
+                self.pending_sounds.clear();
+            }
+        }
+    }
+
     fn enqueue(
         &mut self,
         p: &Phrase,

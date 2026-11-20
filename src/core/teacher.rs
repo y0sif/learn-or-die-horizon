@@ -6,8 +6,8 @@
 //! [`Teacher::speaker_tick`] (always). Events between ticks: [`Teacher::block_broken`],
 //! [`Teacher::block_placed`], [`Teacher::block_used`], [`Teacher::entity_attacked`],
 //! [`Teacher::entity_used`] and the keys ([`Teacher::what_is_this`] and the others). Call [`Teacher::joined_level`] whenever the level object changes,
-//! before the first world tick in it. A new pack means a new `Teacher`, as a language switch
-//! rebuilds everything in the original.
+//! before the first world tick in it. A new pack means a new `Teacher`; after a resource reload
+//! the new one goes on where the last one stood ([`Teacher::carry_on`]).
 use super::config::Config;
 use super::consequences::{self, ServerAction, Wipe};
 use super::detector::{Detector, Speech};
@@ -191,6 +191,25 @@ impl Teacher {
             integrated_server: false,
             hardcore: false,
         }
+    }
+
+    /// A resource reload built this teacher from the pack again: he goes on where `previous`
+    /// stood, as in the original, which rebuilds nothing on a reload that keeps the pack's
+    /// language (`ZhNarratorClient.onLanguagePacksScanned`). He keeps the quiz with its open
+    /// question and its exam, what he was about to say, the trackers, and the world and dimension
+    /// he is in, so the next join of the same level is no new world. The clip playing is cut, as
+    /// a reload stops the game's sounds; the rest of the queue follows.
+    pub fn carry_on(&mut self, previous: &mut Teacher, now: i64) {
+        self.quiz = std::mem::take(&mut previous.quiz);
+        self.speaker = std::mem::take(&mut previous.speaker);
+        self.speaker.cut(now);
+        self.detector = std::mem::take(&mut previous.detector);
+        self.portrait = std::mem::take(&mut previous.portrait);
+        self.held_label = previous.held_label.take();
+        self.last_dimension = previous.last_dimension.take();
+        self.last_world_key = previous.last_world_key.take();
+        self.integrated_server = previous.integrated_server;
+        self.hardcore = previous.hardcore;
     }
 
     /// The level object changed: a world was joined, or the dimension changed. Says the new

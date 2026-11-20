@@ -408,8 +408,9 @@ pub(crate) fn logging_out(host: &mut dyn ClientHost) {
     QUIZ_PAUSES.store(false, Ordering::Relaxed);
 }
 
-/// A resource reload finished: the teacher is built again from the pack, keeping his config and
-/// progress, and joins the level again.
+/// A resource reload finished: the teacher is built again from the pack and goes on where he
+/// stood (config, progress, quiz, exam, speech queue, world), so the level, its trackers and an
+/// open question's screen stay as they are. His clip stops, as the game's sounds do.
 fn reload(
     host: &dyn ClientHost,
     io: &dyn Client,
@@ -430,12 +431,6 @@ fn reload(
             *teacher = Some(loaded.teacher);
             game.pictures = loaded.pictures;
             game.language = loaded.language;
-            game.level = None;
-            game.target = None;
-            game.attacked.clear();
-            game.pending_place = None;
-            game.picture = None;
-            game.typing = None;
         }
         Err(e) => log_warn(format!("the teacher stays away: {e}")),
     }

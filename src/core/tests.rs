@@ -1190,7 +1190,7 @@ fn the_speaker_times_clips_by_their_lipsync() {
         &'static [(&'static str, Option<i32>)],
     );
     #[rustfmt::skip]
-    let scenarios: [Scenario; 3] = [
+    let scenarios: [Scenario; 4] = [
         ("two clips in a chain", |teacher| {
             let display = phrase(&teacher.pack, "pickup.bloop");
             let clips = [display.clone(), phrase(&teacher.pack, "hold.bloop")];
@@ -1233,6 +1233,26 @@ fn the_speaker_times_clips_by_their_lipsync() {
             (50, &[], true, 1, 1, true),
             (90, &[], false, 0, 0, true),
         ], &[("pickup.bloop", Some(1))]),
+        ("a reload cuts the clip, then its chain and the queue go on", |teacher| {
+            let display = phrase(&teacher.pack, "pickup.bloop");
+            let clips = [display.clone(), phrase(&teacher.pack, "hold.bloop")];
+            teacher.say_sequence(&display, &clips, true, START);
+            let next = phrase(&teacher.pack, "pickup.quux");
+            teacher.say_sequence(&next, std::slice::from_ref(&next), true, START);
+            teacher.speaker_tick(START, false);
+            let mut reloaded = teacher_with(Config::default(), &[]);
+            reloaded.progress = std::mem::take(&mut teacher.progress);
+            reloaded.carry_on(teacher, START + 100);
+            *teacher = reloaded;
+        }, &[
+            (100, &[], true, 0, 0, true),
+            (159, &[], true, 0, 0, true),
+            (160, &["normal.hold.bloop"], true, 0, 0, true),
+            (289, &[], true, 2, 2, true),
+            (290, &[], false, 0, 0, true),
+            (539, &[], false, 0, 0, true),
+            (540, &["normal.pickup.quux"], true, 2, 2, true),
+        ], &[("pickup.bloop", Some(1)), ("hold.bloop", Some(1)), ("pickup.quux", Some(1))]),
     ];
     for (name, setup, rows, heard) in scenarios {
         let mut teacher = teacher_with(Config::default(), &[]);

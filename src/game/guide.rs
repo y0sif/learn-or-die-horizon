@@ -14,7 +14,7 @@ use super::keys::{DICTIONARY, GUIDE, MUTE, SETTINGS, SPEED, TOGGLE, WHAT_IS_THIS
 use super::screen::scaled;
 use super::settings::{Page, Settings};
 use super::{Game, log_warn, number, teacher_says};
-use crate::core::{GUIDE_PAGES, GuidePage, Teacher, angry_page};
+use crate::core::{GUIDE_PAGES, GuidePage, Teacher, angry_page, exam_link};
 use mod_api::client::widgets::{Button, Outcome as Input, WidgetId, Widgets};
 use mod_api::{ClientHost, DrawContext, Flow, Text};
 
@@ -79,8 +79,9 @@ fn key(host: &dyn ClientHost, io: &dyn Client, id: &str) -> Text {
     io.key_name(host, id)
 }
 
-/// The page's text (`pageText`): the keys page names the keys, the angry page says what his
-/// temper does after how many wrong answers in a row, the others point to the settings.
+/// The page's text (`pageText`): the keys page names the keys, the questions page says when the
+/// exam comes, the angry page says what his temper does after how many wrong answers in a row,
+/// the others point to the settings.
 fn page_text(host: &dyn ClientHost, io: &dyn Client, teacher: &Teacher, page: GuidePage) -> Text {
     let key = |id: &str| key(host, io, id);
     match page {
@@ -105,6 +106,16 @@ fn page_text(host: &dyn ClientHost, io: &dyn Client, teacher: &Teacher, page: Gu
                 format!("learnordie.guide.angry.text.{mode}"),
                 vec![Text::literal(after.to_string()), key(SETTINGS)],
             )
+        }
+        GuidePage::Questions => {
+            // When the exam comes: every `examMinutes` of play with `examAuto`, else on demand.
+            let exam = match exam_link(&teacher.config) {
+                Some(minutes) => {
+                    Text::translate("learnordie.guide.exam.auto", vec![Text::literal(minutes)])
+                }
+                None => Text::translate("learnordie.guide.exam.manual", vec![]),
+            };
+            Text::translate("learnordie.guide.questions.text", vec![exam, key(SETTINGS)])
         }
         page => Text::translate(
             format!("learnordie.guide.{}.text", page.name()),

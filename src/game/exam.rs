@@ -43,7 +43,7 @@ pub(crate) struct ResultScreen {
     pub(crate) close: bool,
 }
 
-/// A row's line: the mark, the German in white, its reading, a long dash and the translation.
+/// A row's line: the mark, the German in white, its reading, a middle dot and the translation.
 fn row_line(row: &ExamRow) -> (Text, String) {
     let (mark, colour) = if row.correct {
         ("\u{2713} ", RIGHT)
@@ -60,7 +60,7 @@ fn row_line(row: &ExamRow) -> (Text, String) {
         plain.push_str(&reading);
         line = line.append(coloured(reading, READING));
     }
-    let translation = format!("  \u{2014} {}", row.translation());
+    let translation = format!(" \u{B7} {}", row.translation());
     plain.push_str(&translation);
     (line.append(coloured(translation, TRANSLATION)), plain)
 }

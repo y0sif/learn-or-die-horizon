@@ -19,7 +19,7 @@ use super::client::{Client, WidgetHost};
 use super::hud::{fill, panel};
 use super::screen::{inside, scaled};
 use super::{Game, log_warn, number, sound};
-use crate::core::{ItemName, Label, Part, Phrase, Pictures, Teacher, search};
+use crate::core::{ItemName, Label, Part, Phrase, Pictures, Teacher, bare, search};
 use mod_api::client::widgets::{Button, Outcome as Input, TextField, WidgetId, Widgets};
 use mod_api::{
     ClientHost, DrawContext, Flow, Identifier, ItemKey, SoundPlay, SoundRef, SoundSource, Text,
@@ -39,6 +39,8 @@ const SEARCH_MAX: usize = 32;
 /// Play and Slow.
 const PLAY_W: f32 = 80.0;
 const PLAY_H: f32 = 18.0;
+/// A related form's size.
+const FORM_SCALE: f32 = 1.3;
 
 /// Where the screen's parts are, for a screen of its size (`init`).
 #[derive(Clone, Copy, Debug)]
@@ -148,11 +150,6 @@ fn picture(
     host.item_key(&Identifier::parse(item).ok()?)
 }
 
-/// `Phrase.bare`: a text without its sentence end.
-fn bare(text: &str) -> &str {
-    text.trim_end_matches(|c: char| "\u{3002}\u{FF01}\u{FF1F}.!?".contains(c))
-}
-
 /// `slot`: a sunken inventory slot.
 fn slot(draw: &mut dyn DrawContext, [x, y]: [f32; 2], size: f32) {
     fill(draw, [x, y, x + size, y + size], 0xFF8B_8B8B);
@@ -200,7 +197,8 @@ pub(crate) fn wrap(draw: &dyn DrawContext, text: &str, width: f32) -> Vec<String
     lines
 }
 
-/// `wrapped`: the text in lines 10 px apart from `y`; where the next line would go.
+/// `wrapped`: the text in lines 10 px apart from `y`, a word wider than the room drawn smaller;
+/// where the next line would go.
 fn wrapped(
     draw: &mut dyn DrawContext,
     text: &str,
@@ -208,9 +206,15 @@ fn wrapped(
     right: f32,
     colour: u32,
 ) -> f32 {
+    let room = right - x;
     let mut y = y;
-    for line in wrap(draw, text, right - x) {
-        draw.text(&line, [x, y], colour, true);
+    for line in wrap(draw, text, room) {
+        let width = draw.text_width(&line);
+        if width > room {
+            scaled(draw, Text::literal(line), [x, y], room / width, colour);
+        } else {
+            draw.text(&line, [x, y], colour, true);
+        }
         y += 10.0;
     }
     y
@@ -729,7 +733,9 @@ impl DictionaryScreen {
     }
 
     /// The right pane: the sentence, the translation, Play and Slow (kept inside the pane), the
-    /// grammar notes and the other forms, as far as they fit.
+    /// grammar notes and the other forms, as far as they fit. The translation and the forms wrap
+    /// inside the pane, as the notes do (the original draws them on one line, past a narrow
+    /// window's edge).
     #[allow(clippy::too_many_arguments)]
     fn detail_pane(
         &mut self,
@@ -755,7 +761,17 @@ impl DictionaryScreen {
             ),
             None => l.top + 10.0,
         };
-        let buttons_y = (after + 14.0).min(l.bottom - PLAY_H - 2.0);
+        let label = io.tr(
+            host,
+            &Text::translate("learnordie.dict.translation", vec![]),
+        );
+        let en_x = dx + draw.text_width(&label) + 6.0;
+        let en_lines = match &detail {
+            Some(_) => wrap(draw, &phrase.en, d_right - en_x).len(),
+            None => 1,
+        };
+        let below = 14.0 + 10.0 * en_lines.saturating_sub(1) as f32;
+        let buttons_y = (after + below).min(l.bottom - PLAY_H - 2.0);
         let play = [dx, buttons_y, PLAY_W, PLAY_H];
         let slow = [dx + 86.0, buttons_y, PLAY_W, PLAY_H];
         self.play_at = Some([play, slow]);
@@ -771,13 +787,8 @@ impl DictionaryScreen {
         let Some(detail) = detail else {
             return;
         };
-        let label = io.tr(
-            host,
-            &Text::translate("learnordie.dict.translation", vec![]),
-        );
         draw.text(&label, [dx, after], GREY, true);
-        let label_w = draw.text_width(&label);
-        draw.text(&phrase.en, [dx + label_w + 6.0, after], TEXT, true);
+        wrapped(draw, &phrase.en, [en_x, after], d_right, TEXT);
         let heading = |key: &str| io.tr(host, &Text::translate(key, vec![]));
         let mut y = buttons_y + 28.0;
         draw.text(&heading("learnordie.dict.grammar"), [dx, y], GOLD, true);
@@ -794,18 +805,25 @@ impl DictionaryScreen {
         y += 5.0;
         draw.text(&heading("learnordie.dict.forms"), [dx, y], GOLD, true);
         y += 13.0;
+        let room = d_right - dx;
         for (text, reading, label) in &detail.forms {
-            if y > l.bottom - 22.0 {
+            let lines = wrap(draw, text, room / FORM_SCALE);
+            let labels = wrap(draw, label, room).len();
+            let extra = 14.0 * (lines.len() - 1) as f32 + 10.0 * (labels - 1) as f32;
+            if y + extra > l.bottom - 22.0 {
                 return;
             }
-            scaled(draw, Text::literal(text.clone()), [dx, y], 1.3, TEXT);
-            if !reading.is_empty() {
-                let at = [dx + (draw.text_width(text) * 1.3).floor() + 8.0, y + 3.0];
-                draw.text(reading, at, READING, true);
+            for (i, line) in lines.iter().enumerate() {
+                let width = draw.text_width(line);
+                let s = FORM_SCALE.min(room / width.max(1.0));
+                scaled(draw, Text::literal(line.clone()), [dx, y], s, TEXT);
+                if i + 1 == lines.len() && !reading.is_empty() {
+                    let at = [dx + (width * s).floor() + 8.0, y + 3.0];
+                    draw.text(reading, at, READING, true);
+                }
+                y += 14.0;
             }
-            y += 14.0;
-            draw.text(label, [dx, y], GREY, true);
-            y += 13.0;
+            y = wrapped(draw, label, [dx, y], d_right, GREY) + 3.0;
         }
     }
 }

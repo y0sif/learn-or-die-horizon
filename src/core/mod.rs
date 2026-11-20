@@ -36,6 +36,7 @@ pub use dictionary::{Detail, Dictionary, Form, ItemName, Label, Learned, Note, s
 pub use exam::{ExamResult, ExamRow, ExamStage};
 pub use guide::{GUIDE_AFTER_TICKS, GUIDE_PAGES, GuideCue, GuidePage, angry_page, guide_cue};
 pub use hud::{HudText, Span, spans};
+pub(crate) use pack::bare;
 pub use pack::{Lipsync, Meta, Pack, Part, Phrase, Pictures, Sprite, Word};
 pub use progress::{Progress, REST_FOREVER_MS, World, server_world_key, singleplayer_world_key};
 pub use quiz::{OpenQuestion, QuestionKind, QuizEvent};

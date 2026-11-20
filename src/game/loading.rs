@@ -101,12 +101,14 @@ pub(crate) struct Loaded {
 }
 
 /// The teacher for the pack in the resources now. A teacher already running hands over its config
-/// and progress (it keeps them when the pack fails to load); otherwise both are read from their
-/// files.
+/// and progress, and the rest of where he stands (the quiz and the exam, the speech queue, the
+/// world): the pack's language cannot change here, its namespace being German's, and the
+/// original rebuilds nothing on a reload that keeps it. He keeps it all when the pack fails to
+/// load. With no teacher yet, the config and progress are read from their files.
 pub(crate) fn load(
     host: &dyn ClientHost,
     io: &dyn Client,
-    previous: Option<&mut Teacher>,
+    mut previous: Option<&mut Teacher>,
     now: i64,
 ) -> Result<Loaded, String> {
     let phrases = text(host, io, "phrases.json")?.ok_or_else(|| {
@@ -125,13 +127,16 @@ pub(crate) fn load(
         "{NAMESPACE}: {} phrases loaded, {resolved} of {total} sound events resolved",
         pack.phrases().len()
     ));
-    let progress = match previous {
+    let progress = match previous.as_deref_mut() {
         Some(teacher) => std::mem::take(&mut teacher.progress),
         None => files::load_progress(host, io, &pack.meta.language),
     };
     let pictures = pack.pictures(io.item_ids(host));
     let seed = (now as u64) ^ 0x9E37_79B9_7F4A_7C15;
     let mut teacher = Teacher::new(pack, config, progress, seed);
+    if let Some(previous) = previous {
+        teacher.carry_on(previous, now);
+    }
     teacher.dictionary = dictionary(host, io);
     Ok(Loaded {
         teacher,

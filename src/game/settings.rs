@@ -331,7 +331,7 @@ fn exam_button(host: &dyn ClientHost, io: &dyn Client, teacher: &mut Teacher, ga
 }
 
 /// A row's value changed: saved at once; a new translation language loads the pack again on the
-/// next client tick (the teacher keeps his config and progress).
+/// next client tick (the teacher goes on where he stood: config, progress, quiz and exam).
 fn changed(host: &dyn ClientHost, io: &dyn Client, teacher: &Teacher, game: &mut Game, row: &str) {
     files::save_config(host, io, &teacher.config);
     if row == "hint_language" {
