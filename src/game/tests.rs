@@ -1047,18 +1047,6 @@ fn hooks_drive_the_teacher() {
             config.expect("config written")["quizIntervalSeconds"],
             Value::from(15.0)
         );
-        // A controller's slider is the row's button, its handle where a click keeps the value
-        // shown, so a nudge goes on from the value.
-        let row = canvas.button("options.quiz_answer");
-        let sliders = super::pad_sliders();
-        let &(_, value, [from, span]) = sliders.iter().find(|(rect, ..)| *rect == row).unwrap();
-        assert!(value > 0.0 && value < 1.0, "{value}");
-        let answer = || with_state(|t, _| t.expect("the teacher").config.quiz_answer_seconds);
-        let before = answer();
-        let at = screen_at([from + value * span, row[1] + row[3] / 2.0]);
-        mod_api::dispatch_screen_mouse_button_pressed_pre(&host, &at, 0, 0, &mut false);
-        mod_api::dispatch_screen_mouse_button_released_pre(&host, &at, 0, 0, &mut false);
-        assert_eq!(answer(), before);
         assert!(click_at(&host, canvas.button("options.advanced")));
         assert_eq!(settings_page(), Some(Page::Advanced));
         assert!(press(&host, &screen, "key.keyboard.escape"));

@@ -20,7 +20,7 @@
 use super::client::{Client, WidgetHost};
 use super::guide::GuideScreen;
 use super::screen::inside;
-use super::{Game, PAD_SLIDERS, files, keys, lock, log_info, number, teacher_says};
+use super::{Game, files, keys, log_info, number, teacher_says};
 pub(crate) use crate::core::Page;
 use crate::core::{Config, ExamStage, Pack, Setting, Shown, Teacher, exam_link, settings as rows};
 use mod_api::client::widgets::{Button, Outcome as Input, WidgetId, Widgets};
@@ -384,8 +384,7 @@ fn back(teacher: &Teacher, game: &mut Game) {
 /// The page: the world and the HUD blurred and the in-world menu background over them
 /// (`Screen.renderBackground` in a world, as the original's `OptionsSubScreen` has it), the title,
 /// the buttons, and over each slider row the slider's track, handle and label (the buttons stay
-/// under them for the narrator, a controller and horizon-ctl's `ui`). The sliders are left for
-/// the `pad_sliders` mixin, which makes each a controller's slider.
+/// under them for the narrator, a controller and horizon-ctl's `ui`).
 pub(super) fn render(
     host: &dyn ClientHost,
     io: &dyn Client,
@@ -422,7 +421,6 @@ pub(super) fn render(
         }
     }
     let focused = page.widgets.focused();
-    let mut sliders = Vec::new();
     for (index, row) in page.rows.iter().enumerate() {
         let Some(&rect) = page.rects.get(index).filter(|_| row.is_slider()) else {
             continue;
@@ -437,8 +435,6 @@ pub(super) fn render(
         };
         draw.gui_nine_slice(track, rect, WHITE);
         let at = handle_at(row.position(&teacher.config), row.positions());
-        // The span `position_at` reads a click along.
-        sliders.push((rect, at, [x + 4.0, rw - 8.0]));
         let handle = if inside(mouse, rect) || held {
             HANDLE_HOVERED
         } else {
@@ -455,7 +451,6 @@ pub(super) fn render(
             true,
         );
     }
-    *lock(&PAD_SLIDERS) = sliders;
 }
 
 /// Esc goes back a page (the main page lets Escape close the screen); the arrows move a focused

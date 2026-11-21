@@ -12,13 +12,13 @@
 //! The input hooks' host only reads, so an answer is recorded here and the next client tick
 //! closes the screen and writes the chat line.
 //!
-//! A controller's A, right stick, B and Start and its on-screen keyboard reach these hooks only
-//! through a separate stopgap mod (`padbridge`), as the mouse and keys do; the settings' sliders
-//! are its sliders (the `pad_sliders` mixin).
+//! A controller's A, right stick, B and Start, its on-screen keyboard and the D-pad on a slider
+//! that A grabbed reach these hooks only through a separate stopgap mod (`padbridge`), as the
+//! mouse and keys do, so this mod has no controller mixins of its own (each would arrive twice).
 use super::hud::{self, GOLD, frame, panel, width};
 use super::{
-    ESCAPE_PAUSE, Game, PAD_SLIDERS, QUIZ_PAUSES, STATE, State, dictionary, guide, lock, number,
-    settings, sound, typing,
+    ESCAPE_PAUSE, Game, QUIZ_PAUSES, STATE, State, dictionary, guide, lock, number, settings,
+    sound, typing,
 };
 use crate::core::{ExamStage, OpenQuestion, Phrase, QuestionKind, Teacher};
 use mod_api::client::hud_layout::PoseOp;
@@ -261,7 +261,6 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
     let Some(teacher) = teacher.as_ref() else {
         return;
     };
-    lock(&PAD_SLIDERS).clear();
     let draw = &mut *event.draw;
     if game.settings.is_some() {
         settings::render(host, io, draw, teacher, game, mouse);
