@@ -20,7 +20,7 @@ namespaces = ["zhnarrator_de"]
 
 [native]
 game = "26.3"
-horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+horizon = "8f83e5c85ae3b9a117f742e8d91170c5c9080a06"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
 
 # A mod screen never pauses single player (Screen::Mod is not a pause screen). The original's QuizScreen
