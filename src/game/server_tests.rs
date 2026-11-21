@@ -713,6 +713,7 @@ fn consequences_reach_the_host_player() {
                 with_mods(mods.into(), || {
                     mod_api::dispatch_entity_interact(
                         HostSide::Server(&mut host),
+                        "minecraft:overworld",
                         Hand::Main,
                         SHEEP as i32,
                         "minecraft:sheep",
