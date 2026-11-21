@@ -91,6 +91,24 @@ pub(super) fn inside([x, y]: [f32; 2], [rx, ry, rw, rh]: [f32; 4]) -> bool {
     (rx..rx + rw).contains(&x) && (ry..ry + rh).contains(&y)
 }
 
+/// A list's scrollbar: the dark track at `[x, y, width, height]` and the thumb on it at `thumb`
+/// (its top and height), lighter while it is held.
+pub(super) fn scrollbar(
+    draw: &mut dyn DrawContext,
+    [x, y, w, h]: [f32; 4],
+    [ty, th]: [f32; 2],
+    held: bool,
+) {
+    hud::fill(draw, [x, y, x + w, y + h], 0x6600_0000);
+    let (edge, face) = if held {
+        (0xFFE0_E0E0, 0xFFFF_FFFF)
+    } else {
+        (0xFFA8_A8A8, 0xFFC6_C6C6)
+    };
+    hud::fill(draw, [x, ty, x + w, ty + th], edge);
+    hud::fill(draw, [x, ty, x + w - 1.0, ty + th - 1.0], face);
+}
+
 /// `NarratorHud.lift`: the colour moved `f` of the way to white.
 fn lift(rgb: u32, f: f32) -> u32 {
     let channel = |shift: u32| {
@@ -528,7 +546,8 @@ pub(crate) fn mouse_pressed(
     Flow::Cancel
 }
 
-/// The wheel over the screen: the exam's result or the dictionary's list scrolls.
+/// The wheel over the screen: the exam's result, the dictionary's list or a settings page that
+/// overflows scrolls.
 pub(crate) fn mouse_scrolled(
     host: &dyn ClientHost,
     event: &mut ScreenMouseScrolledPreEvent<'_>,
@@ -544,6 +563,8 @@ pub(crate) fn mouse_scrolled(
         page.scrolled(dy)
     } else if let Some(page) = game.dictionary.as_mut() {
         page.scrolled(event.screen.mouse, dy)
+    } else if let Some(page) = game.settings.as_mut() {
+        page.scrolled(dy)
     } else {
         false
     };

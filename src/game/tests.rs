@@ -390,6 +390,31 @@ impl Canvas {
     fn shows(&self, text: &str) -> bool {
         self.texts.iter().any(|t| t == text)
     }
+
+    /// A page drawn as a list that scrolls: each button inside the screen or scrolled out above
+    /// it, none overlapping another on it. Whether the one whose label holds `part` shows.
+    fn scrolled_list(&self, part: &str) -> bool {
+        let [sw, sh] = self.size();
+        let on: Vec<_> = self
+            .buttons
+            .iter()
+            .filter(|(_, r)| r[1] + r[3] > 0.0)
+            .collect();
+        for (label, [x, y, w, h]) in &on {
+            let inside = *x >= 0.0 && *y >= 0.0 && x + w <= sw && y + h <= sh;
+            assert!(inside, "{label} at {:?}", [x, y, w, h]);
+        }
+        for (i, (a, ra)) in on.iter().enumerate() {
+            for (b, rb) in &on[i + 1..] {
+                let apart = ra[0] + ra[2] <= rb[0]
+                    || rb[0] + rb[2] <= ra[0]
+                    || ra[1] + ra[3] <= rb[1]
+                    || rb[1] + rb[3] <= ra[1];
+                assert!(apart, "{a} at {ra:?} overlaps {b} at {rb:?}");
+            }
+        }
+        on.iter().any(|(label, _)| label.contains(part))
+    }
 }
 
 impl DrawContext for Canvas {
@@ -1230,6 +1255,20 @@ fn hooks_drive_the_teacher() {
         // begin at once, each with its header, the HUD naming the next between them.
         io.session().clicks.push(keys::SETTINGS);
         tick(&mut host, &io, 50);
+        // On his 2880 by 1800 screen (GUI scale 7) the main page's lines do not all fit above
+        // Done: the rest wait out of the screen until the wheel brings them in, the guide's link
+        // last, and Tab onto a line scrolled out brings it back.
+        let his = [412.0, 258.0];
+        let guide = "learnordie.options.guide";
+        assert!(!drawn(&host, his, [0.0, 0.0]).scrolled_list(guide));
+        for _ in 0..3 {
+            assert!(mouse(&host, [200.0, 100.0], Mouse::Wheel(-1.0)));
+        }
+        let canvas = drawn(&host, his, [0.0, 0.0]);
+        assert!(canvas.scrolled_list(guide) && !canvas.scrolled_list("options.enabled"));
+        assert!(press(&host, &screen_at([0.0, 0.0]), "key.keyboard.tab"));
+        let canvas = drawn(&host, his, [0.0, 0.0]);
+        assert!(canvas.scrolled_list("options.enabled") && !canvas.scrolled_list(guide));
         let canvas = drawn(&host, SMALL, [0.0, 0.0]);
         canvas.all_on_screen();
         assert!(click_at(

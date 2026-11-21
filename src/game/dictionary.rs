@@ -17,7 +17,7 @@
 //! Esc closes it.
 use super::client::{Client, WidgetHost};
 use super::hud::{fill, panel};
-use super::screen::{inside, scaled};
+use super::screen::{inside, scaled, scrollbar};
 use super::{Game, log_warn, number, sound};
 use crate::core::{ItemName, Label, Part, Phrase, Pictures, Teacher, bare, search};
 use mod_api::client::widgets::{Button, Outcome as Input, TextField, WidgetId, Widgets};
@@ -755,18 +755,8 @@ impl DictionaryScreen {
             let (tx, th) = (l.track_x(), self.thumb_h());
             let last = (self.shown.len() - l.rows) as f32;
             let ty = l.list_top + ((l.track_h() - th) * (self.scroll as f32 / last)).floor();
-            fill(
-                draw,
-                [tx, l.list_top, tx + BAR_W, l.list_top + l.track_h()],
-                0x6600_0000,
-            );
-            let (edge, face) = if self.dragging {
-                (0xFFE0_E0E0, WHITE)
-            } else {
-                (0xFFA8_A8A8, 0xFFC6_C6C6)
-            };
-            fill(draw, [tx, ty, tx + BAR_W, ty + th], edge);
-            fill(draw, [tx, ty, tx + BAR_W - 1.0, ty + th - 1.0], face);
+            let track = [tx, l.list_top, BAR_W, l.track_h()];
+            scrollbar(draw, track, [ty, th], self.dragging);
         }
         for i in 0..l.rows {
             let Some(phrase) = self
@@ -929,7 +919,16 @@ impl DictionaryScreen {
             }
             y = draw_lines(draw, note, [dx, y], d_right, TEXT) + 3.0;
         }
-        if pane.forms.is_empty() || y > l.bottom - 30.0 {
+        // How far below a form's first line its last starts.
+        let extra = |texts: &[Line], labels: &[Line]| {
+            14.0 * texts.len().saturating_sub(1) as f32
+                + 10.0 * labels.len().saturating_sub(1) as f32
+        };
+        // The heading only with its first form under it.
+        let Some((texts, labels)) = pane.forms.first() else {
+            return;
+        };
+        if y + 18.0 + extra(texts, labels) > l.bottom - 22.0 {
             return;
         }
         y += 5.0;
@@ -937,8 +936,7 @@ impl DictionaryScreen {
         y += 13.0;
         let room = d_right - dx;
         for ((_, reading, _), (texts, labels)) in detail.forms.iter().zip(&pane.forms) {
-            let extra = 14.0 * (texts.len() - 1) as f32 + 10.0 * (labels.len() - 1) as f32;
-            if y + extra > l.bottom - 22.0 {
+            if y + extra(texts, labels) > l.bottom - 22.0 {
                 return;
             }
             for (i, (line, width)) in texts.iter().enumerate() {

@@ -15,11 +15,16 @@
 //! once and closes the screen, or Stop while one runs, which drops it, turns `examAuto` off and
 //! says so in chat. Not in a world, the button is off.
 //!
+//! A page with more lines than fit above Done scrolls a line at a time, as the original's options
+//! list scrolls: by the wheel, by its scrollbar (a click or a drag on it), and to the button Tab
+//! moves to.
+//!
 //! Esc or Done goes back a page; on the main page it closes the screen. Like an options screen,
 //! a page pauses single player and blurs the world and the HUD behind it.
 use super::client::{Client, WidgetHost};
+use super::dictionary::wrap;
 use super::guide::GuideScreen;
-use super::screen::inside;
+use super::screen::{inside, scrollbar};
 use super::{Game, files, keys, log_info, number, teacher_says};
 pub(crate) use crate::core::Page;
 use crate::core::{Config, ExamStage, Pack, Setting, Shown, Teacher, exam_link, settings as rows};
@@ -39,6 +44,14 @@ const MIN_PITCH: f32 = 21.0;
 /// Done in the footer, from the bottom.
 const FOOTER: f32 = 27.0;
 const DONE_W: f32 = 200.0;
+/// A line scrolled out of the page: its buttons wait far above the screen, where nothing shows
+/// them, no click reaches them and horizon-ctl's `ui` does not list them.
+const HIDDEN_Y: f32 = -1000.0;
+/// The scrollbar's width, and the gap between it and the rows.
+const BAR_W: f32 = 6.0;
+const BAR_GAP: f32 = 6.0;
+/// A tooltip's lines wrap at this width (`Tooltip.MAX_WIDTH`).
+const TOOLTIP_W: f32 = 170.0;
 const WHITE: u32 = 0xFFFF_FFFF;
 /// Shift in the screen hooks' modifiers.
 const SHIFT: u32 = 1;
@@ -160,6 +173,39 @@ fn position_at(x: f32, [rx, _, rw, _]: [f32; 4], positions: usize) -> usize {
     }
 }
 
+/// How a page's lines stood when last placed.
+#[derive(Clone, Copy, Debug, Default)]
+struct Window {
+    /// Every line: the rows' and the links'.
+    lines: usize,
+    /// How many fit above Done.
+    fit: usize,
+    pitch: f32,
+    /// The scrollbar's left edge.
+    bar_x: f32,
+}
+
+impl Window {
+    fn overflows(&self) -> bool {
+        self.lines > self.fit
+    }
+
+    /// The last line the page can scroll to show first.
+    fn last(&self) -> usize {
+        self.lines.saturating_sub(self.fit)
+    }
+
+    /// The scrollbar's height: from the first line shown to the end of the last.
+    fn track_h(&self) -> f32 {
+        self.fit.saturating_sub(1) as f32 * self.pitch + BUTTON_H
+    }
+
+    fn thumb_h(&self) -> f32 {
+        let h = self.track_h() * self.fit as f32 / self.lines.max(1) as f32;
+        h.floor().max(12.0)
+    }
+}
+
 /// A settings page showing.
 pub(crate) struct Settings {
     page: Page,
@@ -174,6 +220,11 @@ pub(crate) struct Settings {
     rects: Vec<[f32; 4]>,
     /// The slider row a drag holds.
     dragging: Option<usize>,
+    /// The first line shown, and how the lines stood when last placed.
+    scroll: usize,
+    window: Window,
+    /// The scrollbar is held.
+    bar_held: bool,
     /// Done or Esc on the main page: the next client tick closes the screen.
     close: bool,
 }
@@ -198,6 +249,9 @@ impl Settings {
             done,
             rects: Vec::new(),
             dragging: None,
+            scroll: 0,
+            window: Window::default(),
+            bar_held: false,
             close: false,
         }
     }
@@ -213,7 +267,9 @@ impl Settings {
     }
 
     /// The buttons where they go in a screen of `size`, each label showing its value; the exam's
-    /// Start or Stop as the exam stands, off outside a world.
+    /// Start or Stop as the exam stands, off outside a world. The lines that do not fit above
+    /// Done at the smallest pitch scroll: those before `scroll` and after the last that fits wait
+    /// at [`HIDDEN_Y`].
     fn place(&mut self, [w, h]: [f32; 2], teacher: &Teacher, now: i64, in_world: bool) {
         let config = &teacher.config;
         let lines = lines(&self.rows);
@@ -224,9 +280,22 @@ impl Settings {
         let done_y = h - FOOTER;
         let room = done_y - 4.0 - TOP;
         let pitch = (room / count.max(1) as f32).floor().clamp(MIN_PITCH, PITCH);
+        let fit = ((room - BUTTON_H) / pitch).floor().max(0.0) as usize + 1;
+        self.window = Window {
+            lines: count,
+            fit,
+            pitch,
+            bar_x: (left + wide + BAR_GAP).min(w - BAR_W - 1.0),
+        };
+        self.scroll = self.scroll.min(self.window.last());
+        let first = self.scroll;
+        let line_y = |line: usize| match line.checked_sub(first) {
+            Some(shown) if shown < fit => TOP + shown as f32 * pitch,
+            _ => HIDDEN_Y,
+        };
         let mut rects = vec![[0.0; 4]; self.rows.len()];
         for (line, rows) in lines.iter().enumerate() {
-            let y = TOP + line as f32 * pitch;
+            let y = line_y(line);
             match rows.as_slice() {
                 [a, b] => {
                     rects[*a] = [left, y, small, BUTTON_H];
@@ -246,8 +315,7 @@ impl Settings {
         for (index, &(id, link)) in self.links.iter().enumerate() {
             let (label, active) = link_label(link, teacher, now, in_world);
             if let Some(button) = self.widgets.button_mut(id) {
-                let line = (lines.len() + index) as f32;
-                button.rect = [left, TOP + line * pitch, wide, BUTTON_H];
+                button.rect = [left, line_y(lines.len() + index), wide, BUTTON_H];
                 button.label = label;
                 button.active = active;
                 rects.push(button.rect);
@@ -271,10 +339,84 @@ impl Settings {
         self.buttons.iter().position(|button| *button == id)
     }
 
+    /// The line a widget stands on: a row's or a link's (Done stays in the footer).
+    fn line_of(&self, id: WidgetId) -> Option<usize> {
+        let lines = lines(&self.rows);
+        if let Some(index) = self.row_of(id) {
+            return lines.iter().position(|line| line.contains(&index));
+        }
+        let link = self.links.iter().position(|(link, _)| *link == id)?;
+        Some(lines.len() + link)
+    }
+
+    /// The focused button's line scrolled into view, as `AbstractSelectionList` scrolls to the
+    /// entry Tab moves to.
+    fn reveal(&mut self) {
+        let fit = self.window.fit;
+        let Some(line) = self.widgets.focused().and_then(|id| self.line_of(id)) else {
+            return;
+        };
+        if fit == 0 {
+            return;
+        }
+        if line < self.scroll {
+            self.scroll = line;
+        } else if line >= self.scroll + fit {
+            self.scroll = line + 1 - fit;
+        }
+    }
+
+    fn on_scrollbar(&self, [x, y]: [f32; 2]) -> bool {
+        let w = &self.window;
+        w.overflows()
+            && x >= w.bar_x - 2.0
+            && x <= w.bar_x + BAR_W + 2.0
+            && y >= TOP - 2.0
+            && y <= TOP + w.track_h() + 2.0
+    }
+
+    /// The thumb's middle follows the pointer.
+    fn scroll_to(&mut self, y: f32) {
+        let w = self.window;
+        let range = w.track_h() - w.thumb_h();
+        let f = if range <= 0.0 {
+            0.0
+        } else {
+            (y - TOP - w.thumb_h() / 2.0) / range
+        };
+        self.scroll = (f.clamp(0.0, 1.0) * w.last() as f32).round() as usize;
+    }
+
+    /// The wheel moves a page that overflows a line a notch.
+    pub(crate) fn scrolled(&mut self, dy: f64) -> bool {
+        if !self.window.overflows() {
+            return false;
+        }
+        if dy != 0.0 {
+            let by = -(dy.signum() as i64);
+            let to = (self.scroll as i64 + by).clamp(0, self.window.last() as i64);
+            self.scroll = to as usize;
+        }
+        true
+    }
+
+    /// The scrollbar, when the page overflows (as [`super::dictionary`] draws its list's).
+    fn draw_scrollbar(&self, draw: &mut dyn DrawContext) {
+        let w = self.window;
+        if !w.overflows() {
+            return;
+        }
+        let (track, thumb) = (w.track_h(), w.thumb_h());
+        let at = (track - thumb) * self.scroll as f32 / w.last() as f32;
+        let track = [w.bar_x, TOP, BAR_W, track];
+        scrollbar(draw, track, [TOP + at.floor(), thumb], self.bar_held);
+    }
+
     /// A mouse button let go: a drag ends.
     pub(crate) fn released(&mut self, button: i32) -> bool {
         let dragging = self.dragging.take().is_some();
-        self.widgets.mouse_released(button).handled() || dragging
+        let bar = std::mem::take(&mut self.bar_held) && button == 0;
+        self.widgets.mouse_released(button).handled() || dragging || bar
     }
 }
 
@@ -408,21 +550,11 @@ pub(super) fn render(
     if let Err(e) = page.widgets.draw(draw, &widgets_host, mouse) {
         super::log_warn(format!("could not draw the settings: {e:?}"));
     }
-    let start = page.links.iter().find(|(_, link)| *link == Link::Exam);
-    if let Some(button) = start.and_then(|(id, _)| page.widgets.button(*id))
-        && inside(mouse, button.rect)
-    {
-        let tip = Text::translate(
-            "learnordie.exam.start.tooltip",
-            vec![number(EXAM_QUESTIONS)],
-        );
-        if let Err(e) = draw.gui_tooltip(&[tip], mouse) {
-            super::log_warn(format!("could not draw the exam's tooltip: {e:?}"));
-        }
-    }
+    page.draw_scrollbar(draw);
     let focused = page.widgets.focused();
     for (index, row) in page.rows.iter().enumerate() {
-        let Some(&rect) = page.rects.get(index).filter(|_| row.is_slider()) else {
+        let shown = |rect: &&[f32; 4]| row.is_slider() && rect[1] != HIDDEN_Y;
+        let Some(&rect) = page.rects.get(index).filter(shown) else {
             continue;
         };
         let [x, y, rw, rh] = rect;
@@ -450,6 +582,21 @@ pub(super) fn render(
             WHITE,
             true,
         );
+    }
+    let start = page.links.iter().find(|(_, link)| *link == Link::Exam);
+    if let Some(button) = start.and_then(|(id, _)| page.widgets.button(*id))
+        && inside(mouse, button.rect)
+    {
+        let tip = Text::translate(
+            "learnordie.exam.start.tooltip",
+            vec![number(EXAM_QUESTIONS)],
+        );
+        // `Tooltip.create`: the text wrapped as `Font.split` wraps it.
+        let tip = wrap(&*draw, &io.tr(host, &tip), TOOLTIP_W);
+        let tip: Vec<Text> = tip.into_iter().map(Text::literal).collect();
+        if let Err(e) = draw.gui_tooltip(&tip, mouse) {
+            super::log_warn(format!("could not draw the exam's tooltip: {e:?}"));
+        }
     }
 }
 
@@ -490,6 +637,7 @@ pub(super) fn key_pressed(
     let input = page
         .widgets
         .key_pressed(&WidgetHost { io, host }, key, modifiers);
+    page.reveal();
     if let Input::Pressed(id) = input {
         press(host, io, teacher, game, id, None, modifiers);
     }
@@ -512,6 +660,11 @@ pub(super) fn mouse_pressed(
     let Some(page) = game.settings.as_mut() else {
         return Flow::Continue;
     };
+    if page.on_scrollbar(at) {
+        page.bar_held = true;
+        page.scroll_to(at[1]);
+        return Flow::Cancel;
+    }
     let input = page
         .widgets
         .mouse_pressed(&WidgetHost { io, host }, at, 0, modifiers);
@@ -585,6 +738,10 @@ pub(super) fn dragged(
     let Some(page) = game.settings.as_mut() else {
         return false;
     };
+    if page.bar_held && button == 0 {
+        page.scroll_to(at[1]);
+        return true;
+    }
     let Some(index) = page.dragging.filter(|_| button == 0) else {
         return page
             .widgets
