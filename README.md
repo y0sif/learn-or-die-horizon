@@ -50,7 +50,7 @@ keyboard to type, and the D-pad moves a slider after A grabs it.
 
 ## Install
 
-You need Horizon with game build `0b14f8a` (nightly 2026-11-18) and the official Learn or Die German 0.6.2 jar
+You need Horizon with game build `8f83e5c` (nightly 2026-11-21) and the official Learn or Die German 0.6.2 jar
 for Minecraft 26.3, `learn-or-die-german-0.6.2+mc26.3.jar`, from the
 [official release](https://github.com/Larenlearn/learn-or-die/releases/tag/v0.6.2). The port reads the
 German pack, the voices and the portrait from that jar. It contains none of them itself.
