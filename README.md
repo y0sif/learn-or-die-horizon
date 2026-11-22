@@ -1,13 +1,7 @@
 # Learn or Die (Horizon port)
 
-An unofficial Horizon port of Learn or Die by Laren: a German teacher narrates what you do and quizzes you on it.
-
-Learn or Die is made by Laren. Website: [learnordie.me](https://learnordie.me). Official mod:
-[github.com/Larenlearn/learn-or-die](https://github.com/Larenlearn/learn-or-die).
-
-This port runs it natively on [Horizon](https://github.com/horizon-rust/horizon), the Rust rewrite of
-Minecraft Java 26.3, with Laren's [permission](https://github.com/Larenlearn/learn-or-die/issues/17). For
-problems with the port, open an issue here. For everything else, see the official mod.
+Learn or Die, ported to [Horizon](https://github.com/horizon-rust/horizon), the Rust rewrite of Minecraft
+Java 26.3: a German teacher narrates what you do and quizzes you on it.
 
 ## What it does
 
@@ -65,6 +59,14 @@ German pack, the voices and the portrait from that jar. It contains none of them
 Press I in a world to change the settings: question type and frequency, penalties and rewards, the angry
 teacher, the exam, speech speed and volume, tooltips, and which actions the teacher talks about. They are saved
 at once to `config/learnordie.json` in the instance folder, with the original's setting names and defaults.
+
+## Credits and support
+
+Learn or Die is made by Laren. Website: [learnordie.me](https://learnordie.me). Official mod:
+[github.com/Larenlearn/learn-or-die](https://github.com/Larenlearn/learn-or-die). This port is made with
+Laren's [permission](https://github.com/Larenlearn/learn-or-die/issues/17).
+
+For problems with the port, open an issue here. For everything else, see the official mod.
 
 ## License
 

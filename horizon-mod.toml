@@ -1,7 +1,7 @@
 id = "learnordie"
 name = "Learn or Die (Horizon port)"
 version = "0.1.0"
-description = "An unofficial Horizon port of Learn or Die by Laren: a German teacher narrates what you do and quizzes you on it."
+description = "Learn or Die, ported to Horizon: a German teacher narrates what you do and quizzes you on it."
 authors = ["Laren (original Learn or Die)", "y0sif (Horizon port)"]
 # Laren's terms, which the port keeps (LICENSE): the Mods screen shows them and credits Laren.
 license = "All Rights Reserved"
